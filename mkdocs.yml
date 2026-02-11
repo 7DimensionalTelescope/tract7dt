@@ -1,0 +1,35 @@
+site_name: tract7dt
+site_description: 7DT image-specific Tractor photometry pipeline
+repo_url: https://github.com/seoldh99/tract7dt
+site_url: https://seoldh99.github.io/tract7dt/
+
+theme:
+  name: material
+  features:
+    - navigation.indexes
+    - navigation.sections
+    - search.suggest
+    - search.highlight
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - tables
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Installation: installation.md
+  - Quick Start: quickstart.md
+  - Commands: commands.md
+  - Configuration:
+      - Overview: configuration.md
+  - Pipeline Behavior: pipeline-behavior.md
+  - Performance Tuning: performance.md
+  - Outputs: outputs.md
+  - Sample Data: sample-data.md
+  - Troubleshooting: troubleshooting.md
+  - Release Checklist: RELEASE_CHECKLIST.md

@@ -1,0 +1,151 @@
+# tract7dt sample configuration
+
+# Must-change parameters:
+# - ALL inputs.*
+# - outputs.work_dir
+
+# Absolute paths are allowed for all path-like parameters.
+# Relative paths will be resolved against the directory of the config file.
+# But! For outputs.* except outputs.work_dir, their relative paths will be resolved against the outputs.work_dir.
+
+# If one or some parameter lines are missing, the pipeline will use the default values stored in the config.py file.
+# This sample config file contains all the parameters.
+
+inputs:
+  tile_name: "your_tile_name"                     # Informational tile name. Does not affect the pipeline.
+  input_catalog: "path/to/input_catalog.csv"  # Path to input catalog CSV file with ID/RA/DEC/TYPE, optional FLUX_{band}/ELL/THETA/Re.
+  image_list_file: "path/to/image_list.txt"     # Path to input image list txt file; one FITS path per line; blank lines and # comments allowed.
+  gaiaxp_synphot_csv: "path/to/gaiaxp_synphot.csv" # Path to GaiaXP synphot CSV file for this tile.
+
+outputs:
+  work_dir: "/data2/seoldh/test_tract7dt" # Path to base work & output directory.
+  cropped_images_dir: "cropped_images" # Path to PNGs from crop + source overlay plots.
+  epsf_dir: "EPSFs"                    # Path to EPSF outputs (epsf.npy, meta, pngs).
+  patches_dir: "patches"               # Path to Patch definitions (patches.csv/json).
+  patch_inputs_dir: "patch_payloads"   # Path to Patch payloads (*.pkl.gz).
+  tractor_out_dir: "outputs"           # Path to Patch run outputs.
+  final_catalog: "output_catalog.csv"  # Path to Merged catalog output.
+
+image_scaling:
+  zp_ref: 25.0                         # Reference ZP for scaling.
+
+crop:
+  enabled: true                        # Crop away noisy edges.
+  margin: 500                          # Crop margin in pixels.
+  plot_pre_crop: true                  # Save pre-crop white image with crop box.
+  display_downsample: 4                # Downsample for pre-crop plot.
+  post_crop_display_downsample: 4      # Downsample for post-crop white plot.
+  overlay_catalog: true                # Overlay catalog positions on white image.
+  overlay_downsample_full: 4           # Downsample for overlay plot.
+  overlay_downsample_crop: 4           # Reserved (not used in reference).
+#  overlay_crop_box: [4000, 5000, 4000, 5000] # Example zoom region.
+#  overlay_crop_enabled: true           # Reserved (not used in reference).
+
+checks:
+  require_wcs_alignment: true          # Enforce WCS alignment across input images.
+  wcs_tolerance:
+    crval: 1.0e-6                      # Tolerance for CRVAL (deg).
+    crpix: 1.0e-6                      # Tolerance for CRPIX (pix).
+    cd: 1.0e-9                         # Tolerance for CD/PC matrix.
+    cdelt: 1.0e-9                      # Tolerance for CDELT (deg/pix).
+  require_same_shape: true             # Enforce same array shape for all images. Should be true.
+
+source_saturation_cut:
+  enabled: true                       # Drop sources near saturated pixels before patch/input generation.
+  radius_pix: 20.0                      # Radial search size [pix] around source position.
+  require_all_bands: false             # false:any-band saturation removes; true:all bands must be saturated.
+
+logging:
+  ignore_warnings: true                # Suppress Python warnings.
+  level: "INFO"                        # Python logging level: DEBUG/INFO/WARNING/ERROR.
+  file: null                           # Optional log file path. null -> console only.
+  format: "%(asctime)s | %(name)s | %(levelname)s | %(message)s"  # Log line format.
+
+performance:
+  frame_prep_workers: "auto"           # Workers for per-frame loading/preparation in load_inputs ("auto" or integer).
+  white_stack_workers: "auto"          # Workers for white-stack row-chunk accumulation ("auto" or integer).
+
+epsf:
+  use_gaiaxp: true                     # Enable GaiaXP-based seed selection.
+  epsf_ngrid: 7                        # ePSF grid size.
+  ngrid: 6                             # Downstream patch grid size.
+  skip_empty_epsf_patches: true        # Skip ePSF cells with no input-catalog sources; build downstream patches only for active ePSF cells.
+  thresh_sigma: 10.0                   # SEP detection threshold.
+  minarea: 25                          # SEP min area.
+  cutout_size: 61                      # Cutout size for ePSF building.
+  edge_pad: 10                         # Edge padding for star selection.
+  min_sep: 30.0                        # Minimum separation between stars.
+  max_stars: 30                        # Maximum stars per patch.
+  q_range: [0.95, 1.05]                # SEP roundness filter (a/b).
+  psfstar_mode: "sep+gaia"                 # "sep", "sep+gaia", or "gaia".
+  gaia_mag_min: 10.0                   # Gaia magnitude min.
+  gaia_mag_max: 30.0                   # Gaia magnitude max.
+  gaia_snap_to_sep: true               # Snap Gaia seeds to SEP detections.
+  gaia_forced_k_fwhm: 1.5              # Forced photometry radius scale.
+  gaia_forced_rmin_pix: 3.0            # Minimum forced radius.
+  gaia_forced_rmax_pix: 15.0           # Maximum forced radius.
+  gaia_snr_min: 20.0                   # Minimum SNR for Gaia seeds.
+  gaia_match_r_pix: 5.0                # Gaia/SEP match radius.
+  gaia_seed_sat_r: 5                   # Saturation check box radius.
+  gaia_seed_sat_div: 1.3               # Saturation check divisor.
+  oversamp: 1                          # EPSF oversampling.
+  maxiters: 30                         # EPSFBuilder iterations.
+  do_clip: true                        # Sigma clip for EPSFBuilder.
+  recenter_boxsize: 9                  # Recentering box size.
+  final_psf_size: 55                   # Final PSF crop size.
+  save_star_montage_max: 100           # Stars in montage.
+  parallel_bands: true                 # Build bands in parallel.
+  max_workers: "auto"                  # "auto" or integer.
+
+patches:
+  halo_pix_min: 20                     # "Minimum" halo size to prevent a model crossing a patch boundary. If your target is too large, you may need to increase this. halo_pix is set to max((final_psf_size-1)/2+2, halo_pix_min).
+
+patch_inputs:
+  save_patch_inputs: true              # Save *.pkl.gz payloads. Keep this true for CLI runs.
+  skip_empty_patch: true               # Skip patches with no sources.
+  include_wcs_in_payload: false        # Store WCS in payloads. For further developments.
+  max_workers: 16                      # Thread workers for writing. Reduce if you face I/O bottleneck.
+  gzip_compresslevel: 1                # gzip compress level (1: fast, 9: best compression).
+  keep_payloads_in_memory: false       # Keep payloads in RAM.
+
+patch_run:
+  python_exe: "python"                 # Python executable for subprocess.
+  resume: false                        # Skip patches with existing outputs. Be careful with this=true especially when you re-run the pipeline with altered config parameters, because it will skip the patches that have already been run.
+  max_workers: 32                      # Subprocess workers.
+  threads_per_process: 1               # BLAS/OpenMP threads per process.
+  gal_model: "exp"                     # Default model if TYPE missing: "dev", "exp", "sersic", or "star".
+  n_opt_iters: 25                      # Max optimization iterations.
+  dlnp_stop: 1.0e-6                    # Convergence threshold.
+  r_ap: 5.0                            # Aperture radius for flux init.
+  eps_flux: 1.0e-4                     # Minimum flux floor.
+  sersic_n_init: 3.0                   # Initial Sersic n for sersic model.
+  re_fallback_pix: 3.0                 # Fallback Re when missing in catalog.
+  psf_model: "pixelized"               # ePSF-present model: "pixelized", "hybrid", or "gaussian_mixture_from_stamp".
+  psf_fallback_model: "moffat" # ePSF-missing fallback: "gaussian_mixture" (not recommended), "ncircular_gaussian", or "moffat".
+  min_epsf_nstars_for_use: 5           # If ePSF exists but nstars_used < this, treat as low-star ePSF failure and fallback.
+  ncircular_gaussian_n: 3              # Number of NCircularGaussianPSF components when psf_fallback_model="ncircular_gaussian". Allowed: 1, 2, 3.
+  hybrid_psf_n: 9                      # HybridPixelizedPSF N parameter.
+  gaussian_mixture_n: 4                # Number of Gaussian components for GaussianMixturePSF.fromStamp.
+  fallback_default_fwhm_pix: 4.0       # Default FWHM [pix] when PEEING/SEEING is missing.
+  fallback_stamp_radius_pix: 25.0      # Stamp radius [pix] used to synthesize Gaussian fallback stamp.
+  cutout_size: 100                     # Cutout size for montages.
+  cutout_max_sources: null             # Limit montage count.
+  cutout_start: 0                      # Montage start index.
+  cutout_data_p_lo: 1                  # Data display low percentile.
+  cutout_data_p_hi: 99                 # Data display high percentile.
+  cutout_model_p_lo: 1                 # Model display low percentile.
+  cutout_model_p_hi: 99                # Model display high percentile.
+  cutout_resid_p_abs: 99               # Residual display percentile (abs).
+  no_cutouts: false                    # Disable montages.
+  no_patch_overview: false             # Disable patch overview.
+  flag_maxiter_margin: 0               # Margin for opt_hit_max_iters flag.
+
+moffat_psf:
+  fwhm_default_pix: 4.0                # Legacy key (use patch_run.fallback_default_fwhm_pix instead).
+  beta: 3.5                            # Used when patch_run.psf_fallback_model="moffat".
+  radius_pix: 25.0                     # Used when patch_run.psf_fallback_model="moffat".
+  module_path: null                    # Legacy.
+
+merge:
+  pattern: "*_cat_fit.csv"             # Patch catalog glob.
+  wcs_fits: null                       # Optional FITS for RA_fit/DEC_fit.
