@@ -1,87 +1,253 @@
 # Configuration
 
-The pipeline is controlled by one YAML file.
+The pipeline is controlled by one YAML file. All pipeline commands require `--config /path/to/config.yaml`.
 
-- Start from `tract7dt/data/sample_config.yaml`.
-- Unknown keys are rejected.
-- Missing keys fall back to defaults from `tract7dt/config.py`.
+- Start from `tract7dt/data/sample_config.yaml` (or generate it with `tract7dt dump-config`).
+- **Unknown keys are rejected** — misspelled keys produce a `KeyError` listing the offending key path.
+- **Type validation** — each key's type is validated against the expected type. For example, passing a string where an integer is expected raises `TypeError`.
+- **Missing keys** fall back to defaults defined in `tract7dt/config.py`.
 
 ## Path Resolution Rules
 
-- `inputs.*` relative paths resolve against the YAML file directory.
-- `outputs.work_dir` resolves against YAML directory if relative.
-- Other `outputs.*` relative paths resolve against `outputs.work_dir`.
+Understanding how relative paths are resolved is critical:
+
+| Config section | Base directory for relative paths |
+|---------------|----------------------------------|
+| `inputs.input_catalog` | YAML config file directory |
+| `inputs.image_list_file` | YAML config file directory |
+| `inputs.gaiaxp_synphot_csv` | YAML config file directory |
+| `outputs.work_dir` | YAML config file directory |
+| `outputs.*` (all others) | `outputs.work_dir` |
+| `merge.wcs_fits` | YAML config file directory |
+| `moffat_psf.module_path` | YAML config file directory |
+| `logging.file` | YAML config file directory |
+
+Absolute paths are always used as-is. All relative paths are expanded with `Path.expanduser()` and resolved to absolute paths during config loading.
 
 ## Top-Level Sections
 
-- `inputs`
-- `outputs`
-- `image_scaling`
-- `crop`
-- `checks`
-- `source_saturation_cut`
-- `logging`
-- `performance`
-- `epsf`
-- `patches`
-- `patch_inputs`
-- `patch_run`
-- `moffat_psf`
-- `merge`
+The YAML file is organized into these sections:
 
-## Operationally Important Options
+| Section | Purpose |
+|---------|---------|
+| [`inputs`](#inputs) | Paths to input data (catalog, images, GaiaXP) |
+| [`outputs`](#outputs) | Paths to output directories and files |
+| [`image_scaling`](#image_scaling) | Photometric scaling parameters |
+| [`crop`](#crop) | Edge-crop filtering and diagnostic plots |
+| [`checks`](#checks) | WCS and shape validation controls |
+| [`source_saturation_cut`](#source_saturation_cut) | Pre-fit saturation-based source removal |
+| [`logging`](#logging) | Python logging configuration |
+| [`performance`](#performance) | Parallelism controls for the load stage |
+| [`epsf`](#epsf) | Effective PSF construction parameters |
+| [`patches`](#patches) | Patch geometry |
+| [`patch_inputs`](#patch_inputs) | Patch payload building |
+| [`patch_run`](#patch_run) | Tractor fitting subprocess parameters |
+| [`moffat_psf`](#moffat_psf) | Moffat PSF fallback parameters |
+| [`merge`](#merge) | Final catalog merge settings |
 
-### `crop.*`
+---
 
-- `enabled`: enable crop filtering + cropped image products
-- `margin`: crop margin in pixels
-- `display_downsample`: pre-crop white diagnostic DS
-- `post_crop_display_downsample`: post-crop white diagnostic DS
-- `overlay_catalog`: enable white+catalog overlay plot
-- `overlay_downsample_full`: DS for overlay rendering
+## `inputs`
 
-### `source_saturation_cut.*`
+Paths to the three input data files. See [Input Catalog Reference](input-catalog.md) for detailed format documentation.
 
-- `enabled`: remove sources near saturation before patch generation
-- `radius_pix`: radial neighborhood used for saturation test
-- `require_all_bands`: any-band vs all-bands removal criterion
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `tile_name` | string | `"UDS"` | Informational tile/field name. Does not affect pipeline behavior. |
+| `input_catalog` | path | — | Path to input source catalog CSV. **Must be set.** |
+| `image_list_file` | path | — | Path to text file listing FITS image paths. **Must be set.** |
+| `gaiaxp_synphot_csv` | path | — | Path to GaiaXP synthetic photometry CSV. Set to `null` or omit if not using GaiaXP. |
 
-### `performance.*`
+## `outputs`
 
-- `frame_prep_workers`: workers for per-frame load/prep (`auto` or int)
-- `white_stack_workers`: workers for white stack chunk accumulation (`auto` or int)
+Paths to output directories and files. All paths except `work_dir` are resolved relative to `work_dir` if given as relative paths.
 
-`auto` means capped by both CPU count and available jobs.
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `work_dir` | path | — | Base output directory. **Must be set.** Created if it does not exist. |
+| `epsf_dir` | path | `"EPSFs"` | Directory for ePSF products (`.npy`, montages, meta). |
+| `patches_dir` | path | `"patches"` | Directory for patch definition files (`patches.csv`, `patches.json`). |
+| `patch_inputs_dir` | path | `"patch_payloads"` | Directory for compressed patch payloads (`*.pkl.gz`). |
+| `tractor_out_dir` | path | `"outputs"` | Directory for per-patch Tractor fit outputs. |
+| `final_catalog` | path | `"output_catalog.csv"` | Path for the merged final catalog CSV. |
+| `cropped_images_dir` | path | `"cropped_images"` | Directory for white-stack and overlay diagnostic PNGs. |
 
-### `epsf.*`
+## `image_scaling`
 
-- `epsf_ngrid`: ePSF grid size
-- `ngrid`: patch grid subdivision per ePSF cell
-- `parallel_bands`: build ePSF bands concurrently
-- `max_workers`: worker count for ePSF band execution
-- `skip_empty_epsf_patches`: skip ePSF cells with no input sources
+| Key | Type | Default | Unit | Description |
+|-----|------|---------|------|-------------|
+| `zp_ref` | float | `25.0` | mag (AB) | Reference zero-point. All images are scaled to this ZP. The scaling factor per image is `10^(-0.4 * (ZP_AUTO - zp_ref))`. |
 
-### `patch_inputs.*`
+## `crop`
 
-- `skip_empty_patch`: skip writing payloads for patches with zero sources
-- `max_workers`: async write worker count
-- `gzip_compresslevel`: payload compression level
+Controls the removal of noisy edge regions (common in stacked images) and associated diagnostic plots.
 
-### `patch_run.*`
+| Key | Type | Default | Unit | Description |
+|-----|------|---------|------|-------------|
+| `enabled` | bool | `true` | — | Enable edge-crop filtering. When true, a margin is removed from all edges of the white stack and per-band arrays. Sources outside the crop box are excluded from fitting. |
+| `margin` | int | `500` | pixels | Width of the edge strip to remove on each side. The crop box is `[margin, W-margin) x [margin, H-margin)`. |
+| `plot_pre_crop` | bool | `true` | — | Save a pre-crop white-stack diagnostic PNG with crop box overlay. |
+| `display_downsample` | int | `4` | factor | Downsampling factor for the pre-crop white diagnostic plot (reduces rendering time and file size). |
+| `post_crop_display_downsample` | int | `4` | factor | Downsampling factor for the post-crop white diagnostic plot. |
+| `overlay_catalog` | bool | `true` | — | Render a white-stack + source overlay plot color-coded by TYPE. |
+| `overlay_downsample_full` | int | `4` | factor | Downsampling factor for the full-field overlay plot. |
+| `overlay_downsample_crop` | int | `4` | factor | Reserved for future zoomed overlay rendering. |
+| `overlay_crop_box` | list of 4 int | `[4000, 5000, 4000, 5000]` | pixels `[x0, x1, y0, y1]` | Reserved zoom region for overlay. |
+| `overlay_crop_enabled` | bool | `true` | — | Reserved. |
 
-- `resume`: skip already completed patch outputs
-- `max_workers`: subprocess concurrency
-- `threads_per_process`: BLAS/OpenMP threads per subprocess
-- `gal_model`: fallback source model when `TYPE` is missing
-- `psf_model` / `psf_fallback_model`: PSF path choices
-- `min_epsf_nstars_for_use`: low-star ePSF quality gate
-- cutout controls (`cutout_*`, `no_cutouts`, `no_patch_overview`)
+## `checks`
 
-### `logging.*`
+Validation gates applied during `load_inputs()` to catch incompatible images early.
 
-- `level`, `file`, `format`, `ignore_warnings`
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `require_wcs_alignment` | bool | `true` | Enforce that all images share aligned WCS within tolerance. |
+| `wcs_tolerance.crval` | float | `1e-6` | Maximum allowed absolute difference in CRVAL (degrees). |
+| `wcs_tolerance.crpix` | float | `1e-6` | Maximum allowed absolute difference in CRPIX (pixels). |
+| `wcs_tolerance.cd` | float | `1e-9` | Maximum allowed absolute difference in CD or PC matrix elements. |
+| `wcs_tolerance.cdelt` | float | `1e-9` | Maximum allowed absolute difference in CDELT (degrees/pixel). |
+| `require_same_shape` | bool | `true` | Enforce that all images have identical `(NAXIS2, NAXIS1)` dimensions. |
 
-Pipeline commands honor this section after config load.
+## `source_saturation_cut`
+
+Pre-fit filter that removes sources located near saturated pixels. This prevents the optimizer from wasting time on sources whose photometry is corrupted by detector saturation.
+
+| Key | Type | Default | Unit | Description |
+|-----|------|---------|------|-------------|
+| `enabled` | bool | `true` | — | Enable saturation-based source removal. |
+| `radius_pix` | float | `20.0` | pixels | Search radius around each source position. If any pixel within this disk is flagged as saturated, the source may be removed. |
+| `require_all_bands` | bool | `false` | — | `false`: remove if saturated in **any** band (conservative). `true`: remove only if saturated in **all** bands. |
+
+## `logging`
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `ignore_warnings` | bool | `true` | Suppress Python `warnings` module output. |
+| `level` | string | `"INFO"` | Python logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR`. |
+| `file` | path or null | `null` | Optional log file path. `null` means console-only. |
+| `format` | string | `"%(asctime)s \| %(name)s \| %(levelname)s \| %(message)s"` | Python logging format string. |
+
+## `performance`
+
+Worker counts for the two parallelizable steps in `load_inputs()`.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `frame_prep_workers` | int or `"auto"` | `"auto"` | Number of threads for parallel per-frame FITS loading and preparation. `"auto"` = `min(image_count, cpu_count)`. |
+| `white_stack_workers` | int or `"auto"` | `"auto"` | Number of threads for parallel white-stack row-chunk accumulation. `"auto"` = `min(chunk_count, cpu_count)`. |
+
+## `epsf`
+
+Controls the construction of the effective PSF (ePSF) for each band in each spatial grid cell.
+
+| Key | Type | Default | Unit | Description |
+|-----|------|---------|------|-------------|
+| `use_gaiaxp` | bool | `true` | — | Enable GaiaXP synphot catalog for PSF star seed selection. |
+| `epsf_ngrid` | int | `7` | — | ePSF grid dimension. The image is divided into `epsf_ngrid x epsf_ngrid` cells, each getting its own ePSF. |
+| `ngrid` | int | `6` | — | Patch subdivision within each ePSF cell. Each cell is further divided into `ngrid x ngrid` patches for fitting. Total patches (before pruning) = `epsf_ngrid^2 * ngrid^2`. |
+| `skip_empty_epsf_patches` | bool | `true` | — | Skip ePSF cells that contain no input-catalog sources. Also restricts downstream patch definitions to active cells. |
+| `thresh_sigma` | float | `10.0` | sigma | SEP source detection threshold. |
+| `minarea` | int | `25` | pixels | Minimum contiguous pixel area for SEP source detection. |
+| `cutout_size` | int | `61` | pixels | Size of the cutout box extracted around each PSF star candidate for ePSF building. |
+| `edge_pad` | int | `10` | pixels | Edge padding: stars within this many pixels of the cutout edge are rejected. |
+| `min_sep` | float | `30.0` | pixels | Minimum separation between accepted PSF stars (prevents blended pairs). |
+| `max_stars` | int | `30` | — | Maximum number of PSF stars per ePSF cell. |
+| `q_range` | list [float, float] | `[0.95, 1.05]` | dimensionless | Allowed range of SEP roundness parameter `a/b` for PSF star candidates. Values near 1.0 select round sources. |
+| `psfstar_mode` | string | `"sep+gaia"` | — | PSF star selection strategy: `"sep"` (SEP only), `"gaia"` (Gaia only), `"sep+gaia"` (Gaia seeds + SEP supplement). |
+| `gaia_mag_min` | float | `10.0` | mag (AB) | Minimum GaiaXP magnitude for PSF star seeds (rejects saturated stars). |
+| `gaia_mag_max` | float | `30.0` | mag (AB) | Maximum GaiaXP magnitude for PSF star seeds (rejects faint stars). |
+| `gaia_snap_to_sep` | bool | `true` | — | Refine GaiaXP seed positions by snapping to nearest SEP detection. |
+| `gaia_forced_k_fwhm` | float | `1.5` | dimensionless | Scale factor: forced aperture radius = `k_fwhm * FWHM_pix`. |
+| `gaia_forced_rmin_pix` | float | `3.0` | pixels | Minimum forced aperture radius. |
+| `gaia_forced_rmax_pix` | float | `15.0` | pixels | Maximum forced aperture radius. |
+| `gaia_snr_min` | float | `20.0` | dimensionless | Minimum signal-to-noise ratio for PSF star candidates (forced aperture). |
+| `gaia_match_r_pix` | float | `5.0` | pixels | Maximum distance for Gaia-to-SEP position matching (snap radius). |
+| `gaia_seed_sat_r` | int | `5` | pixels | Box half-size for local saturation check around each seed position. |
+| `gaia_seed_sat_div` | float | `1.3` | dimensionless | Saturation threshold divisor: local max must be below `SATURATE / gaia_seed_sat_div`. |
+| `oversamp` | int | `1` | factor | ePSF oversampling factor. |
+| `maxiters` | int | `30` | — | Maximum EPSFBuilder iterations. |
+| `do_clip` | bool | `true` | — | Enable sigma-clipping during ePSF building. |
+| `recenter_boxsize` | int | `9` | pixels | Recentering box size for EPSFBuilder. |
+| `final_psf_size` | int | `55` | pixels | Final ePSF stamp size (center-cropped from the built ePSF). |
+| `save_star_montage_max` | int | `100` | — | Maximum number of stars shown in diagnostic star montage PNGs. |
+| `parallel_bands` | bool | `true` | — | Build ePSF for different bands concurrently. |
+| `max_workers` | int or `"auto"` | `"auto"` | — | Worker count for parallel band execution. `"auto"` = `min(n_bands, cpu_count)`. |
+
+## `patches`
+
+| Key | Type | Default | Unit | Description |
+|-----|------|---------|------|-------------|
+| `halo_pix_min` | int | `20` | pixels | Minimum halo size around each patch. The actual halo is `max((final_psf_size - 1) / 2 + 2, halo_pix_min)`. The halo ensures that source models near patch boundaries are properly evaluated. Increase this if your targets have large angular extent. |
+
+## `patch_inputs`
+
+Controls how per-patch data payloads are built and serialized.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `save_patch_inputs` | bool | `true` | Write `*.pkl.gz` payload files to disk. Must be `true` for CLI-based patch runs. |
+| `skip_empty_patch` | bool | `true` | Skip writing payloads for patches containing zero sources (saves I/O and disk). |
+| `include_wcs_in_payload` | bool | `false` | Store WCS objects in patch payloads. Reserved for future use. |
+| `max_workers` | int | `16` | Thread worker count for parallel payload writing. Reduce if I/O-bound. |
+| `gzip_compresslevel` | int | `1` | gzip compression level for payloads (1=fast, 9=best compression). |
+| `keep_payloads_in_memory` | bool | `false` | Keep built payloads in RAM for potential in-process use. |
+
+## `patch_run`
+
+Controls the Tractor fitting subprocesses that run on each patch.
+
+| Key | Type | Default | Unit | Description |
+|-----|------|---------|------|-------------|
+| `python_exe` | string | `"python"` | — | Python executable for launching subprocesses. |
+| `resume` | bool | `false` | — | Skip patches whose output directories already exist. **Caution:** if you change config parameters and re-run with `resume: true`, previously completed patches will NOT be re-fit with the new parameters. |
+| `max_workers` | int | `32` | — | Maximum concurrent subprocess count. |
+| `threads_per_process` | int | `1` | — | BLAS/OpenMP thread count per subprocess. Avoid oversubscription: `max_workers * threads_per_process ≤ cpu_count`. |
+| `gal_model` | string | `"exp"` | — | Fallback source model when `TYPE` is missing or unrecognized. Choices: `"dev"`, `"exp"`, `"sersic"`, `"star"`. |
+| `n_opt_iters` | int | `25` | — | Maximum Tractor optimization iterations per patch. |
+| `dlnp_stop` | float | `1e-6` | dimensionless | Convergence criterion: stop when the change in log-probability is below this value. |
+| `r_ap` | float | `5.0` | pixels | Aperture radius for SEP-based flux initialization. |
+| `eps_flux` | float | `1e-4` | scaled counts | Minimum flux floor. All initial fluxes are clamped to at least this value. |
+| `sersic_n_init` | float | `3.0` | dimensionless | Initial Sersic index for `SERSIC`-type sources. |
+| `re_fallback_pix` | float | `3.0` | pixels | Default effective radius when `Re` column is absent or `NaN`. |
+| `psf_model` | string | `"pixelized"` | — | PSF model when ePSF is available. Choices: `"pixelized"` (direct pixel array), `"hybrid"` (HybridPixelizedPSF), `"gaussian_mixture_from_stamp"` (fit Gaussian mixture to ePSF stamp). |
+| `psf_fallback_model` | string | `"moffat"` | — | PSF model when ePSF is missing or low-quality. Choices: `"gaussian_mixture"`, `"ncircular_gaussian"`, `"moffat"`. |
+| `min_epsf_nstars_for_use` | int | `5` | — | Quality gate: if an ePSF cell used fewer than this many stars, treat the ePSF as unreliable and use the fallback PSF model. |
+| `ncircular_gaussian_n` | int | `3` | — | Number of components for `NCircularGaussianPSF` fallback. Allowed: 1, 2, 3. |
+| `hybrid_psf_n` | int | `9` | — | N parameter for `HybridPixelizedPSF`. |
+| `gaussian_mixture_n` | int | `4` | — | Number of Gaussian components for `GaussianMixturePSF.fromStamp()`. |
+| `fallback_default_fwhm_pix` | float | `4.0` | pixels | Default FWHM when `PEEING`/`SEEING` is missing from the FITS header (used for fallback PSF). |
+| `fallback_stamp_radius_pix` | float | `25.0` | pixels | Radius of the Gaussian stamp used to synthesize a fallback PSF. |
+| `cutout_size` | int | `100` | pixels | Side length of per-source cutout montages. |
+| `cutout_max_sources` | int or null | `null` | — | Limit the number of source cutout montages per patch. `null` = all sources. |
+| `cutout_start` | int | `0` | — | Start index for cutout montage generation. |
+| `cutout_data_p_lo` | float | `1` | percentile | Low percentile for data cutout display scaling. |
+| `cutout_data_p_hi` | float | `99` | percentile | High percentile for data cutout display scaling. |
+| `cutout_model_p_lo` | float | `1` | percentile | Low percentile for model cutout display scaling. |
+| `cutout_model_p_hi` | float | `99` | percentile | High percentile for model cutout display scaling. |
+| `cutout_resid_p_abs` | float | `99` | percentile | Absolute residual percentile for symmetric color limits. |
+| `no_cutouts` | bool | `false` | — | Disable per-source cutout montage generation (saves disk and time). |
+| `no_patch_overview` | bool | `false` | — | Disable per-patch overview plot (saves disk and time). |
+| `flag_maxiter_margin` | int | `0` | — | Margin for the `opt_hit_max_iters` flag: set to true if the optimizer did not converge and used at least `n_opt_iters - margin` iterations. |
+
+## `moffat_psf`
+
+Parameters for the Moffat PSF model, used when `patch_run.psf_fallback_model: "moffat"`.
+
+| Key | Type | Default | Unit | Description |
+|-----|------|---------|------|-------------|
+| `fwhm_default_pix` | float | `4.0` | pixels | Legacy key. Use `patch_run.fallback_default_fwhm_pix` instead. |
+| `beta` | float | `3.5` | dimensionless | Moffat beta (power-law slope) parameter. Typical values: 2.5–4.5. |
+| `radius_pix` | float | `25.0` | pixels | Moffat PSF stamp radius. |
+| `module_path` | path or null | `null` | — | Legacy. |
+
+## `merge`
+
+Controls how per-patch fit results are joined back to the original input catalog.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `pattern` | string | `"*_cat_fit.csv"` | Glob pattern to find per-patch fit CSV files under `outputs.tractor_out_dir`. |
+| `wcs_fits` | path or null | `null` | Optional FITS file whose WCS is used to compute `RA_fit`/`DEC_fit` from fitted pixel positions. If null, uses the WCS from the first loaded image. |
 
 ## Compatibility Note
 

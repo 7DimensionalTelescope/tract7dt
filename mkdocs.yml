@@ -25,8 +25,8 @@ nav:
   - Installation: installation.md
   - Quick Start: quickstart.md
   - Commands: commands.md
-  - Configuration:
-      - Overview: configuration.md
+  - Input Catalog Reference: input-catalog.md
+  - Configuration: configuration.md
   - Pipeline Behavior: pipeline-behavior.md
   - Performance Tuning: performance.md
   - Outputs: outputs.md

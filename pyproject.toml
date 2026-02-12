@@ -1,6 +1,6 @@
 [project]
 name = "tract7dt"
-version = "0.4.1"
+version = "0.4.2"
 description = "7DT image-specific Tractor photometry pipeline"
 readme = "README.md"
 requires-python = ">=3.10"
