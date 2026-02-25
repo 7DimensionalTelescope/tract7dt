@@ -4,11 +4,13 @@ This page describes the runtime behavior of each pipeline stage as implemented i
 
 ## Pipeline Overview
 
-The full pipeline (`tract7dt run`) executes six sequential stages:
+The full pipeline (`tract7dt run`) executes up to eight sequential stages:
 
 ```
-load_inputs → build_epsf → build_patches → build_patch_inputs → run_patches → merge
+load_inputs → [augment_gaia] → build_epsf → build_patches → build_patch_inputs → run_patches → merge → [compute_zp]
 ```
+
+Stages in brackets are conditional on `zp.enabled: true`.
 
 Each stage can also be run independently via its own CLI command (see [Commands](commands.md)).
 
@@ -119,6 +121,32 @@ load_inputs timing [s]: prep=X.XX white=X.XX crop=X.XX sat=X.XX overlay=X.XX tot
 
 ---
 
+## Stage 1b: Augment Catalog with Gaia Sources (if `zp.enabled`)
+
+**Function:** `augment_catalog_with_gaia()` in `zp.py`
+
+Injects GaiaXP synphot sources into the input catalog so they can be fitted by the Tractor and used for zero-point calibration.
+
+### Augmentation Flow
+
+1. Load GaiaXP synphot CSV. Filter by `zp.gaia_mag_min <= phot_g_mean_mag <= zp.gaia_mag_max`.
+2. Project Gaia source RA/DEC to pixel coordinates using WCS.
+3. Compute a square bounding box around all original input catalog sources. Expand to at least `zp.min_box_size_pix x min_box_size_pix`. Shift to keep square at image edges; clamp to crop bounds if the image is smaller.
+4. Filter Gaia sources to those within the bounding box.
+5. RA/DEC match Gaia sources against the input catalog (using `zp.match_radius_arcsec`). Tag matched original sources with `gaia_source_id`. Backfill missing `FLUX_{band}` values for matched sources from Gaia synphot magnitudes.
+6. Remove already-matched Gaia sources from the injection pool. Apply saturation filtering (same config as `source_saturation_cut`) to remaining Gaia sources.
+7. Create new catalog rows for unmatched Gaia sources: `ID=gaia_{source_id}`, `TYPE=STAR`, `FLUX_{band}` from synphot magnitudes (`10^((zp_ref - mag_{band}) / 2.5)`).
+8. Concatenate original catalog + new Gaia rows. Save as `ZP/{name}_with_Gaia.csv`.
+9. Generate augmentation overlay plot.
+
+### Bounding Box Logic
+
+- The box is the tightest square containing all original catalog sources, expanded to at least `min_box_size_pix` on each side.
+- When the box hits an image edge, it shifts to maintain the square shape.
+- If the image is smaller than `min_box_size_pix` in either dimension, the box is clamped to the image bounds.
+
+---
+
 ## Stage 2: Build ePSF
 
 **Function:** `build_epsf_from_config()` → `epsf.build_epsf()`
@@ -221,6 +249,13 @@ If `patch_inputs.skip_empty_patch: true`:
 
 Launches independent Python subprocesses to fit each patch.
 
+### Fitting Modes
+
+The fitting behavior is controlled by `patch_run.enable_multi_band_simultaneous_fitting`:
+
+- **`true` (default) — Multi-band simultaneous fitting:** All bands are loaded into a single Tractor instance. The optimizer adjusts positions and morphology (shared across bands) and per-band fluxes simultaneously in one optimization run. This leverages cross-band information for tighter constraints.
+- **`false` — Single-band independent fitting:** Each band is fitted independently in a separate Tractor instance. Position, morphology, and flux can all differ per band. All bands start from the same initial guesses (from the shared input catalog), but fitted values diverge independently. Bands are processed serially within each patch subprocess; parallelism occurs at the patch level.
+
 ### Per-Patch Fitting Flow
 
 For each patch subprocess:
@@ -235,9 +270,11 @@ For each patch subprocess:
    - Assign Tractor source model based on `TYPE` (or fallback).
    - Initialize fluxes from `FLUX_{band}` or aperture photometry.
    - Initialize galaxy shape from `ELL`, `THETA`, `Re` (or defaults).
-5. **Optimize:** Run the `ConstrainedOptimizer` for up to `n_opt_iters` iterations, stopping early if `dlnp < dlnp_stop`.
-6. **Extract results:** Record fitted positions, fluxes, flux errors, morphology parameters, and convergence diagnostics.
-7. **Generate diagnostics:** Cutout montages, patch overview plot.
+5. **Optimize:**
+   - *Multi-band mode:* Run the `ConstrainedOptimizer` on a single Tractor (all bands) for up to `n_opt_iters` iterations, stopping early if `dlnp < dlnp_stop`.
+   - *Single-band mode:* For each band, create a separate Tractor (one image), build a fresh catalog from the same input, and run the optimizer independently.
+6. **Extract results:** Record fitted positions, fluxes, flux errors, morphology parameters, and convergence diagnostics. In single-band mode, all fitted parameters are stored per band (e.g. `Re_{band}_fit`, `THETA_{band}_fit`); source type (`stype_fit`) is shared.
+7. **Generate diagnostics:** Cutout montages, patch overview plot. In single-band mode, each band's model is rendered from its own fitted Tractor, and each band column in the montage shows that band's own fitted position.
 
 ### Progress Display
 
@@ -267,9 +304,9 @@ Combines all per-patch fit results into a single catalog.
 3. Collect all `*_cat_fit.csv` files matching `merge.pattern`.
 4. From each patch catalog, keep only fit-specific columns (those not already in the base catalog, plus the merge key).
 5. Concatenate all patch catalogs.
-6. Check for duplicate merge keys (raises `ValueError` if found — indicates a bug in patch assignment).
+6. Check for duplicate merge keys. Duplicates are dropped (keeping first occurrence) with a warning; this can occur for sources on patch boundaries.
 7. Left-join the base catalog with fit results.
-8. Optionally compute `RA_fit`/`DEC_fit` from fitted pixel positions using WCS.
+8. Optionally compute sky coordinates from fitted pixel positions using WCS. In multi-band mode: `RA_fit`/`DEC_fit` from `x_pix_white_fit`/`y_pix_white_fit`. In single-band mode: `RA_{band}_fit`/`DEC_{band}_fit` from `x_pix_white_{band}_fit`/`y_pix_white_{band}_fit` for each band.
 9. Write the final catalog.
 
 ### Exclusion Columns
@@ -282,6 +319,33 @@ The merge adds four exclusion tracking columns:
 - `excluded_reason` (string): `"crop"`, `"saturation"`, `"crop+saturation"`, or `""`.
 
 See [Outputs](outputs.md) for complete column documentation.
+
+---
+
+## Stage 7: Compute Zero-Point Calibration (if `zp.enabled`)
+
+**Function:** `compute_zp()` in `zp.py`
+
+Derives per-band zero-point from Gaia-matched stars and applies AB magnitudes to all sources.
+
+### ZP Computation Flow
+
+1. Read the merged catalog. Identify Gaia-matched sources by non-empty `gaia_source_id`.
+2. Exclude non-converged sources from the ZP star pool:
+   - Multi-band mode: filter upfront using `opt_converged`.
+   - Single-band mode: filter per-band using `opt_converged_{band}`.
+3. For each band:
+   a. Compute per-star ZP: `ZP_i = mag_{band}_gaia + 2.5 * log10(FLUX_{band}_fit)`.
+   b. Propagate flux error: `ZP_err_i = (2.5/ln10) * (FLUXERR/FLUX)`.
+   c. Apply MAD-based iterative sigma clipping (`zp.clip_sigma`, `zp.clip_max_iters`).
+   d. Compute weighted median ZP (weighted by `1/ZP_err^2`) and MAD-based error.
+   e. Apply to all sources: `MAG_{band}_fit = ZP - 2.5*log10(FLUX)`, `MAGERR_{band}_fit = sqrt((flux_err_term)^2 + ZP_err^2)`.
+4. Save diagnostic plots and summary CSVs to the `ZP/` directory.
+5. Overwrite the merged catalog with the additional `MAG_*_fit` and `MAGERR_*_fit` columns.
+
+### Standalone ZP Re-run
+
+`tract7dt compute-zp --config ...` re-runs only steps 1-5 on the existing merged catalog. This is useful for adjusting `zp.clip_sigma` or `zp.clip_max_iters` without re-fitting. The augmentation parameters require a full pipeline re-run.
 
 ---
 

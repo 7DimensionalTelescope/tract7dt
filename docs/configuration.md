@@ -44,6 +44,8 @@ The YAML file is organized into these sections:
 | [`patch_run`](#patch_run) | Tractor fitting subprocess parameters |
 | [`moffat_psf`](#moffat_psf) | Moffat PSF fallback parameters |
 | [`merge`](#merge) | Final catalog merge settings |
+| [`plotting`](#plotting) | Plot DPI settings |
+| [`zp`](#zp) | Zero-point calibration using GaiaXP |
 
 ---
 
@@ -198,12 +200,13 @@ Controls the Tractor fitting subprocesses that run on each patch.
 
 | Key | Type | Default | Unit | Description |
 |-----|------|---------|------|-------------|
+| `enable_multi_band_simultaneous_fitting` | bool | `true` | — | **Fitting mode.** `true`: fit all bands simultaneously (position and morphology shared across bands, per-band fluxes). `false`: fit each band independently (position, morphology, and flux all vary per band). See [Pipeline Behavior — Stage 5](pipeline-behavior.md#stage-5-run-patch-subprocesses) for details. |
 | `python_exe` | string | `"python"` | — | Python executable for launching subprocesses. |
 | `resume` | bool | `false` | — | Skip patches whose output directories already exist. **Caution:** if you change config parameters and re-run with `resume: true`, previously completed patches will NOT be re-fit with the new parameters. |
 | `max_workers` | int | `32` | — | Maximum concurrent subprocess count. |
 | `threads_per_process` | int | `1` | — | BLAS/OpenMP thread count per subprocess. Avoid oversubscription: `max_workers * threads_per_process ≤ cpu_count`. |
 | `gal_model` | string | `"exp"` | — | Fallback source model when `TYPE` is missing or unrecognized. Choices: `"dev"`, `"exp"`, `"sersic"`, `"star"`. |
-| `n_opt_iters` | int | `25` | — | Maximum Tractor optimization iterations per patch. |
+| `n_opt_iters` | int | `25` | — | Maximum Tractor optimization iterations. In multi-band mode this is per patch; in single-band mode this is per band within each patch. |
 | `dlnp_stop` | float | `1e-6` | dimensionless | Convergence criterion: stop when the change in log-probability is below this value. |
 | `r_ap` | float | `5.0` | pixels | Aperture radius for SEP-based flux initialization. |
 | `eps_flux` | float | `1e-4` | scaled counts | Minimum flux floor. All initial fluxes are clamped to at least this value. |
@@ -247,7 +250,30 @@ Controls how per-patch fit results are joined back to the original input catalog
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `pattern` | string | `"*_cat_fit.csv"` | Glob pattern to find per-patch fit CSV files under `outputs.tractor_out_dir`. |
-| `wcs_fits` | path or null | `null` | Optional FITS file whose WCS is used to compute `RA_fit`/`DEC_fit` from fitted pixel positions. If null, uses the WCS from the first loaded image. |
+| `wcs_fits` | path or null | `null` | Optional FITS file whose WCS is used to compute sky coordinates from fitted pixel positions (`RA_fit`/`DEC_fit` in multi-band mode; `RA_{band}_fit`/`DEC_{band}_fit` in single-band mode). If null, uses the WCS from the first loaded image. |
+
+## `plotting`
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `dpi` | int | `300` | DPI for all diagnostic PNG plots (white-stack overlays, ePSF stamps, patch overviews, source montages, ZP plots, augmentation overlay). |
+
+## `zp`
+
+Controls zero-point calibration using GaiaXP synthetic photometry. When enabled, Gaia synphot sources are injected into the input catalog before fitting, and per-band ZP is computed after merge.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Enable zero-point calibration. When true, two additional pipeline stages are activated: Gaia catalog augmentation (after load) and ZP computation (after merge). |
+| `gaia_mag_min` | float | `8.0` | Minimum `phot_g_mean_mag` for Gaia source selection. |
+| `gaia_mag_max` | float | `18.0` | Maximum `phot_g_mean_mag` for Gaia source selection. |
+| `match_radius_arcsec` | float | `3.0` | RA/DEC match radius (arcsec) for deduplication against the input catalog. |
+| `min_box_size_pix` | int | `1000` | Minimum side length (pixels) of the square Gaia selection bounding box. |
+| `clip_sigma` | float | `3.0` | MAD-based sigma clipping threshold for ZP computation. |
+| `clip_max_iters` | int | `10` | Maximum sigma-clipping iterations. |
+
+!!! note "Re-running ZP independently"
+    `tract7dt compute-zp --config ...` re-runs only the ZP computation step on the existing merged catalog. Only `clip_sigma` and `clip_max_iters` take effect in this mode. The augmentation parameters (`gaia_mag_min`, `gaia_mag_max`, `match_radius_arcsec`, `min_box_size_pix`) are baked into the catalog at augmentation time and require a full pipeline re-run to change.
 
 ## Compatibility Note
 

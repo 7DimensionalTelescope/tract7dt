@@ -29,6 +29,7 @@ sep.set_extract_pixstack(1000000)
 
 _EPSF_IMAGE_DICT = None
 _EPSF_CFG = None
+_EPSF_PLOT_DPI = 150
 _EPSF_GAIAXP = None
 _EPSF_USE_GAIAXP = True
 _EPSF_OUT_ROOT = None
@@ -576,7 +577,7 @@ def _build_epsf_from_invvar(*, img: np.ndarray, invvar: np.ndarray, star_tbl: Ta
     )
 
 
-def _save_star_overlay(img: np.ndarray, star_tbl: Table, outpath: Path, title: str):
+def _save_star_overlay(img: np.ndarray, star_tbl: Table, outpath: Path, title: str, dpi: int = 150):
     import matplotlib.pyplot as plt
 
     outpath.parent.mkdir(parents=True, exist_ok=True)
@@ -594,7 +595,7 @@ def _save_star_overlay(img: np.ndarray, star_tbl: Table, outpath: Path, title: s
         ax.set_xticks([])
         ax.set_yticks([])
         plt.tight_layout()
-        plt.savefig(outpath, dpi=150)
+        plt.savefig(outpath, dpi=dpi)
         plt.close(fig)
         return
 
@@ -642,11 +643,11 @@ def _save_star_overlay(img: np.ndarray, star_tbl: Table, outpath: Path, title: s
     ax.set_yticks([])
     ax.legend(loc="upper right", frameon=True, fontsize=9)
     plt.tight_layout()
-    plt.savefig(outpath, dpi=150)
+    plt.savefig(outpath, dpi=dpi)
     plt.close(fig)
 
 
-def _save_epsf_stamp(epsf_arr: np.ndarray, outpath: Path, title: str):
+def _save_epsf_stamp(epsf_arr: np.ndarray, outpath: Path, title: str, dpi: int = 150):
     import matplotlib.pyplot as plt
 
     outpath.parent.mkdir(parents=True, exist_ok=True)
@@ -656,7 +657,7 @@ def _save_epsf_stamp(epsf_arr: np.ndarray, outpath: Path, title: str):
     ax.set_xticks([])
     ax.set_yticks([])
     plt.tight_layout()
-    plt.savefig(outpath, dpi=150)
+    plt.savefig(outpath, dpi=dpi)
     plt.close(fig)
 
 
@@ -665,6 +666,7 @@ def _save_star_montage(
     outpath: Path,
     max_stars: int = 25,
     title: str = "stars",
+    dpi: int = 150,
     id_to_origin: dict[int, str] | None = None,
 ):
     import matplotlib.pyplot as plt
@@ -726,7 +728,7 @@ def _save_star_montage(
             ax.set_title(f"{i} | id={sid} | {origin}", fontsize=9)
 
     fig.suptitle(title, fontsize=12)
-    plt.savefig(outpath, dpi=140)
+    plt.savefig(outpath, dpi=dpi)
     plt.close(fig)
 
 
@@ -967,6 +969,7 @@ def _run_epsf_for_band(
                 star_tbl,
                 outpath=patch_dir / "psfstars.png",
                 title=f"{band} {patch_tag} | stars selected={len(star_tbl)} (gaia_seed={n_seed})",
+                dpi=_EPSF_PLOT_DPI,
             )
 
             res = _build_epsf_from_invvar(img=img, invvar=inv, star_tbl=star_tbl, cfg=cfg)
@@ -1032,7 +1035,7 @@ def _run_epsf_for_band(
                 continue
 
             np.save(patch_dir / "epsf.npy", epsf_arr)
-            _save_epsf_stamp(epsf_arr, outpath=patch_dir / "epsf.png", title=f"{band} {patch_tag} | used={n_used}/{n_extract}")
+            _save_epsf_stamp(epsf_arr, outpath=patch_dir / "epsf.png", title=f"{band} {patch_tag} | used={n_used}/{n_extract}", dpi=_EPSF_PLOT_DPI)
 
             id_to_origin = res.get("id_to_origin", None)
             _save_star_montage(
@@ -1041,6 +1044,7 @@ def _run_epsf_for_band(
                 max_stars=cfg.save_star_montage_max,
                 title=f"{band} {patch_tag} | fitted stars (first {cfg.save_star_montage_max})",
                 id_to_origin=id_to_origin,
+                dpi=_EPSF_PLOT_DPI,
             )
             _save_star_montage(
                 res["stars_all"],
@@ -1048,6 +1052,7 @@ def _run_epsf_for_band(
                 max_stars=cfg.save_star_montage_max,
                 title=f"{band} {patch_tag} | extracted stars (first {cfg.save_star_montage_max})",
                 id_to_origin=id_to_origin,
+                dpi=_EPSF_PLOT_DPI,
             )
 
             meta = dict(
@@ -1091,6 +1096,7 @@ def build_epsf(
     parallel_bands: bool,
     max_workers: int | None,
     active_epsf_tags: set[str] | None = None,
+    plot_dpi: int = 150,
 ) -> Path:
     EPSF_NGRID = int(cfg.epsf_ngrid)
 
@@ -1111,9 +1117,10 @@ def build_epsf(
     use_worker_lines = sys.stderr.isatty() and bool(parallel_bands)
     _inline_width = max(40, shutil.get_terminal_size((80, 24)).columns - 1)
 
-    global _EPSF_IMAGE_DICT, _EPSF_CFG, _EPSF_GAIAXP, _EPSF_USE_GAIAXP, _EPSF_OUT_ROOT, _EPSF_ACTIVE_PATCHES
+    global _EPSF_IMAGE_DICT, _EPSF_CFG, _EPSF_GAIAXP, _EPSF_USE_GAIAXP, _EPSF_OUT_ROOT, _EPSF_ACTIVE_PATCHES, _EPSF_PLOT_DPI
     _EPSF_IMAGE_DICT = image_dict
     _EPSF_CFG = cfg
+    _EPSF_PLOT_DPI = int(plot_dpi)
     _EPSF_GAIAXP = gaiaxp
     _EPSF_USE_GAIAXP = bool(use_gaiaxp)
     _EPSF_OUT_ROOT = out_root

@@ -1,4 +1,4 @@
-# tract7dt
+# Tract7DT
 
 [![Docs](https://github.com/seoldh99/tract7dt/actions/workflows/docs.yml/badge.svg)](https://github.com/seoldh99/tract7dt/actions/workflows/docs.yml)
 

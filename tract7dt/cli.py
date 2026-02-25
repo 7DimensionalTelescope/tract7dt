@@ -64,6 +64,9 @@ def main(argv: list[str] | None = None) -> int:
     ap_merge = sub.add_parser("merge", help="Merge patch outputs only")
     _add_common(ap_merge)
 
+    ap_zp = sub.add_parser("compute-zp", help="Compute zero-point calibration from merged catalog")
+    _add_common(ap_zp)
+
     args = ap.parse_args(argv)
 
     if args.cmd == "dump-config":
@@ -106,6 +109,12 @@ def main(argv: list[str] | None = None) -> int:
         run_patch_subprocesses(cfg)
     elif args.cmd == "merge":
         merge_results(cfg)
+    elif args.cmd == "compute-zp":
+        from .zp import compute_zp
+        merged_path = Path(cfg["outputs"]["final_catalog"])
+        if not merged_path.exists():
+            raise SystemExit(f"Merged catalog not found: {merged_path}. Run 'merge' first.")
+        compute_zp(cfg=cfg, merged_catalog_path=merged_path)
     else:
         raise SystemExit(f"Unknown command: {args.cmd}")
 

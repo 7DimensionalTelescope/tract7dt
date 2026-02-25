@@ -41,9 +41,14 @@ from .moffat_psf import MoffatPSF
 sep.set_sub_object_limit(200000)
 sep.set_extract_pixstack(1000000)
 
+_PATCH_PLOT_DPI = 150
+
 
 @dataclass
 class PatchRunConfig:
+    # Fitting mode
+    enable_multi_band_simultaneous_fitting: bool = True
+
     # Optimization
     n_opt_iters: int = 200
     dlnp_stop: float = 1e-6
@@ -85,6 +90,9 @@ class PatchRunConfig:
     fallback_stamp_radius_pix: float = 25.0
     moffat_beta: float = 3.5
     moffat_radius_pix: float = 25.0
+
+    # Plotting
+    plot_dpi: int = 150
 
 
 def _ensure_dir(p: Path) -> None:
@@ -271,7 +279,7 @@ def _save_hybrid_psf_diagnostics(
             cb = fig.colorbar(sm, ax=ax, fraction=0.046, pad=0.02, extend="neither")
             cb.set_label(cblab)
     outpath.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(outpath, dpi=120)
+    plt.savefig(outpath, dpi=_PATCH_PLOT_DPI)
     plt.close(fig)
     log.info("[PSF] Wrote hybrid PSF diagnostics: %s", str(outpath))
 
@@ -315,7 +323,7 @@ def _save_gaussian_mixture_psf_diagnostics(
             cb = fig.colorbar(sm, ax=ax, fraction=0.046, pad=0.02, extend="neither")
             cb.set_label(cblab)
     outpath.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(outpath, dpi=120)
+    plt.savefig(outpath, dpi=_PATCH_PLOT_DPI)
     plt.close(fig)
     log.info("[PSF] Wrote GaussianMixture PSF diagnostics: %s", str(outpath))
 
@@ -625,7 +633,13 @@ def _true_minmax(arr: np.ndarray):
     return float(a.min()), float(a.max())
 
 
-def _white_from_images(*, images: list[Image], model: bool, tr: Optional[Tractor] = None) -> np.ndarray:
+def _white_from_images(
+    *,
+    images: list[Image],
+    model: bool,
+    tr: Optional[Tractor] = None,
+    model_images: Optional[list[np.ndarray]] = None,
+) -> np.ndarray:
     num = None
     den = None
     for i, tim in enumerate(images):
@@ -634,9 +648,12 @@ def _white_from_images(*, images: list[Image], model: bool, tr: Optional[Tractor
         good = np.isfinite(img) & np.isfinite(inv) & (inv > 0)
         w = np.where(good, inv, 0.0).astype(np.float32, copy=False)
         if model:
-            if tr is None:
-                raise ValueError("tr is required when model=True")
-            m = np.asarray(tr.getModelImage(i), dtype=np.float32)
+            if model_images is not None:
+                m = np.asarray(model_images[i], dtype=np.float32)
+            elif tr is not None:
+                m = np.asarray(tr.getModelImage(i), dtype=np.float32)
+            else:
+                raise ValueError("tr or model_images is required when model=True")
             sky = float(getattr(getattr(tim, "sky", None), "getValue", lambda: 0.0)())
             img_use = m + sky
         else:
@@ -667,13 +684,15 @@ def save_patch_overview(
     model_p_hi: float,
     resid_p_abs: float,
     log: Optional[logging.Logger] = None,
+    model_by_band: Optional[list[np.ndarray]] = None,
+    per_band_fit_positions: Optional[list[tuple[np.ndarray, np.ndarray]]] = None,
 ) -> None:
     meta = meta or {}
     patch_tag = str(meta.get("patch_tag", "patch"))
     nsrc = int(meta.get("n_sources", len(tr.catalog))) if hasattr(tr, "catalog") else 0
 
     white_data = _white_from_images(images=list(tr.images), model=False, tr=None)
-    white_model = _white_from_images(images=list(tr.images), model=True, tr=tr)
+    white_model = _white_from_images(images=list(tr.images), model=True, tr=tr, model_images=model_by_band)
     white_resid = np.asarray(white_data - white_model, dtype=np.float32)
 
     dvmin, dvmax = _robust_limits_percentile(white_data, p_lo=data_p_lo, p_hi=data_p_hi)
@@ -687,8 +706,6 @@ def save_patch_overview(
         ("Residual (white)", white_resid, rvmin, rvmax, "Residual"),
     ]
 
-    x_fit = np.array([float((s.getPosition() if hasattr(s, "getPosition") else s.pos).x) for s in tr.catalog], dtype=float)
-    y_fit = np.array([float((s.getPosition() if hasattr(s, "getPosition") else s.pos).y) for s in tr.catalog], dtype=float)
     x_orig = y_orig = None
     if isinstance(cat_patch, pd.DataFrame) and "x_pix_patch" in cat_patch.columns and "y_pix_patch" in cat_patch.columns:
         x_orig = pd.to_numeric(cat_patch["x_pix_patch"], errors="coerce").to_numpy(dtype=float)
@@ -703,9 +720,33 @@ def save_patch_overview(
             ok = np.isfinite(x_orig) & np.isfinite(y_orig)
             if np.any(ok):
                 ax.scatter(x_orig[ok], y_orig[ok], s=18, marker="x", c="orange", linewidths=0.8, alpha=0.8)
-        okf = np.isfinite(x_fit) & np.isfinite(y_fit)
-        if np.any(okf):
-            ax.scatter(x_fit[okf], y_fit[okf], s=18, marker="x", c="deepskyblue", linewidths=0.8, alpha=0.8)
+
+        if per_band_fit_positions is not None:
+            for bx_all, by_all in per_band_fit_positions:
+                okf = np.isfinite(bx_all) & np.isfinite(by_all)
+                if np.any(okf):
+                    ax.scatter(bx_all[okf], by_all[okf], s=12, marker="x",
+                               c="deepskyblue", linewidths=0.5, alpha=0.5)
+                if x_orig is not None and y_orig is not None:
+                    both_ok = ok & okf
+                    for j in np.where(both_ok)[0]:
+                        ax.plot([x_orig[j], bx_all[j]], [y_orig[j], by_all[j]],
+                                color="deepskyblue", lw=0.3, alpha=0.4)
+        else:
+            x_fit = np.array([float((s.getPosition() if hasattr(s, "getPosition") else s.pos).x)
+                              for s in tr.catalog], dtype=float)
+            y_fit = np.array([float((s.getPosition() if hasattr(s, "getPosition") else s.pos).y)
+                              for s in tr.catalog], dtype=float)
+            okf = np.isfinite(x_fit) & np.isfinite(y_fit)
+            if np.any(okf):
+                ax.scatter(x_fit[okf], y_fit[okf], s=18, marker="x",
+                           c="deepskyblue", linewidths=0.8, alpha=0.8)
+            if x_orig is not None and y_orig is not None:
+                both_ok = ok & okf
+                for j in np.where(both_ok)[0]:
+                    ax.plot([x_orig[j], x_fit[j]], [y_orig[j], y_fit[j]],
+                            color="deepskyblue", lw=0.4, alpha=0.6)
+
         amin, amax = _true_minmax(arr)
         if amin is not None and amax is not None:
             sm = ScalarMappable(norm=Normalize(vmin=amin, vmax=amax), cmap=im.cmap)
@@ -715,7 +756,7 @@ def save_patch_overview(
 
     fig.suptitle(f"patch={patch_tag} | n_sources={nsrc}\norig=x orange, fit=x deepskyblue", fontsize=12)
     outpath.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(outpath, dpi=120)
+    plt.savefig(outpath, dpi=_PATCH_PLOT_DPI)
     plt.close(fig)
     if log:
         log.info("Wrote patch overview: %s", str(outpath))
@@ -755,6 +796,8 @@ def save_source_montages(
     model_p_hi: float,
     resid_p_abs: float,
     log: Optional[logging.Logger] = None,
+    model_by_band: Optional[list[np.ndarray]] = None,
+    per_band_fit_positions: Optional[list[tuple[np.ndarray, np.ndarray]]] = None,
 ) -> None:
     _ensure_dir(outdir)
     meta = meta or {}
@@ -787,7 +830,8 @@ def save_source_montages(
     bandnames = [str(getattr(tim, "name", f"band{i}")) for i, tim in enumerate(tr.images)]
 
     data_by_band = [np.asarray(tim.getImage(), dtype=np.float32) for tim in tr.images]
-    model_by_band = [np.asarray(tr.getModelImage(i), dtype=np.float32) for i in range(len(tr.images))]
+    if model_by_band is None:
+        model_by_band = [np.asarray(tr.getModelImage(i), dtype=np.float32) for i in range(len(tr.images))]
     sky_by_band = [float(getattr(getattr(tim, "sky", None), "getValue", lambda: 0.0)()) for tim in tr.images]
 
     indices = list(range(len(tr.catalog)))
@@ -801,7 +845,12 @@ def save_source_montages(
     for si in indices:
         src = tr.catalog[si]
         pos = src.getPosition() if hasattr(src, "getPosition") else src.pos
-        cx, cy = float(pos.x), float(pos.y)
+
+        if per_band_fit_positions is not None and x_orig_all is not None and y_orig_all is not None:
+            cx = float(x_orig_all[si]) if (si < len(x_orig_all) and np.isfinite(x_orig_all[si])) else float(pos.x)
+            cy = float(y_orig_all[si]) if (si < len(y_orig_all) and np.isfinite(y_orig_all[si])) else float(pos.y)
+        else:
+            cx, cy = float(pos.x), float(pos.y)
 
         sid = None
         if ids is not None and si < len(ids):
@@ -845,13 +894,19 @@ def save_source_montages(
             model = model + sky_by_band[i]
             resid = data - model
 
-            x_fit_c = cx - float(x0)
-            y_fit_c = cy - float(y0)
+            if per_band_fit_positions is not None:
+                bx_all, by_all = per_band_fit_positions[i]
+                x_fit_c = float(bx_all[si]) - float(x0)
+                y_fit_c = float(by_all[si]) - float(y0)
+                x_fit_c_all = bx_all - float(x0)
+                y_fit_c_all = by_all - float(y0)
+            else:
+                x_fit_c = cx - float(x0)
+                y_fit_c = cy - float(y0)
+                x_fit_c_all = x_fit_all - float(x0)
+                y_fit_c_all = y_fit_all - float(y0)
             x_orig_c = (x0_orig - float(x0)) if (x0_orig is not None) else None
             y_orig_c = (y0_orig - float(y0)) if (y0_orig is not None) else None
-
-            x_fit_c_all = x_fit_all - float(x0)
-            y_fit_c_all = y_fit_all - float(y0)
             ok_fit = (
                 np.isfinite(x_fit_c_all)
                 & np.isfinite(y_fit_c_all)
@@ -889,15 +944,22 @@ def save_source_montages(
             else:
                 dvmin = dvmax = mvmin = mvmax = rvmin = rvmax = None
 
+            _has_fit = np.isfinite(x_fit_c) and np.isfinite(y_fit_c)
+            _has_orig = (x_orig_c is not None) and (y_orig_c is not None) and np.isfinite(x_orig_c) and np.isfinite(y_orig_c)
+            _others_connect = (
+                ok_fit_others is not None and ok_orig_others is not None
+                and x_orig_c_all is not None and y_orig_c_all is not None
+            )
+
             ax = axes[0, i]
             im0 = ax.imshow(data, origin="lower", cmap="gray", vmin=dvmin, vmax=dvmax, interpolation="nearest")
             ax.set_title(bn, fontsize=10)
             ax.set_xticks([])
             ax.set_yticks([])
-            if np.isfinite(x_fit_c) and np.isfinite(y_fit_c):
+            if _has_fit:
                 ax.axvline(x_fit_c, color="magenta", lw=0.8, alpha=0.9)
                 ax.axhline(y_fit_c, color="magenta", lw=0.8, alpha=0.9)
-            if (x_orig_c is not None) and (y_orig_c is not None) and np.isfinite(x_orig_c) and np.isfinite(y_orig_c):
+            if _has_orig:
                 ax.axvline(x_orig_c, color="lime", lw=0.8, alpha=0.9, linestyle="--")
                 ax.axhline(y_orig_c, color="lime", lw=0.8, alpha=0.9, linestyle="--")
             if np.any(ok_fit_others):
@@ -920,6 +982,10 @@ def save_source_montages(
                     linewidths=0.8,
                     alpha=0.8,
                 )
+            if _others_connect:
+                for j in np.where(ok_fit_others & ok_orig_others)[0]:
+                    ax.plot([x_orig_c_all[j], x_fit_c_all[j]], [y_orig_c_all[j], y_fit_c_all[j]],
+                            color="cyan", lw=0.4, alpha=0.5)
 
             dmin_true, dmax_true = _true_minmax(data)
             if dmin_true is not None and dmax_true is not None:
@@ -932,10 +998,10 @@ def save_source_montages(
             im1 = ax.imshow(model, origin="lower", cmap="gray", vmin=mvmin, vmax=mvmax, interpolation="nearest")
             ax.set_xticks([])
             ax.set_yticks([])
-            if np.isfinite(x_fit_c) and np.isfinite(y_fit_c):
+            if _has_fit:
                 ax.axvline(x_fit_c, color="magenta", lw=0.8, alpha=0.9)
                 ax.axhline(y_fit_c, color="magenta", lw=0.8, alpha=0.9)
-            if (x_orig_c is not None) and (y_orig_c is not None) and np.isfinite(x_orig_c) and np.isfinite(y_orig_c):
+            if _has_orig:
                 ax.axvline(x_orig_c, color="lime", lw=0.8, alpha=0.9, linestyle="--")
                 ax.axhline(y_orig_c, color="lime", lw=0.8, alpha=0.9, linestyle="--")
             if np.any(ok_fit_others):
@@ -958,6 +1024,10 @@ def save_source_montages(
                     linewidths=0.8,
                     alpha=0.8,
                 )
+            if _others_connect:
+                for j in np.where(ok_fit_others & ok_orig_others)[0]:
+                    ax.plot([x_orig_c_all[j], x_fit_c_all[j]], [y_orig_c_all[j], y_fit_c_all[j]],
+                            color="cyan", lw=0.4, alpha=0.5)
 
             mmin_true, mmax_true = _true_minmax(model)
             if mmin_true is not None and mmax_true is not None:
@@ -970,10 +1040,10 @@ def save_source_montages(
             im2 = ax.imshow(resid, origin="lower", cmap="gray", vmin=rvmin, vmax=rvmax, interpolation="nearest")
             ax.set_xticks([])
             ax.set_yticks([])
-            if np.isfinite(x_fit_c) and np.isfinite(y_fit_c):
+            if _has_fit:
                 ax.axvline(x_fit_c, color="magenta", lw=0.8, alpha=0.9)
                 ax.axhline(y_fit_c, color="magenta", lw=0.8, alpha=0.9)
-            if (x_orig_c is not None) and (y_orig_c is not None) and np.isfinite(x_orig_c) and np.isfinite(y_orig_c):
+            if _has_orig:
                 ax.axvline(x_orig_c, color="lime", lw=0.8, alpha=0.9, linestyle="--")
                 ax.axhline(y_orig_c, color="lime", lw=0.8, alpha=0.9, linestyle="--")
             if np.any(ok_fit_others):
@@ -996,6 +1066,10 @@ def save_source_montages(
                     linewidths=0.8,
                     alpha=0.8,
                 )
+            if _others_connect:
+                for j in np.where(ok_fit_others & ok_orig_others)[0]:
+                    ax.plot([x_orig_c_all[j], x_fit_c_all[j]], [y_orig_c_all[j], y_fit_c_all[j]],
+                            color="cyan", lw=0.4, alpha=0.5)
 
             rmin_true, rmax_true = _true_minmax(resid)
             if rmin_true is not None and rmax_true is not None:
@@ -1012,7 +1086,7 @@ def save_source_montages(
         title = s0 + "\n" + s_legend
         fig.suptitle(title, fontsize=12)
         out_path = outdir / f"src_{si:06d}.png"
-        plt.savefig(out_path, dpi=120)
+        plt.savefig(out_path, dpi=_PATCH_PLOT_DPI)
         plt.close(fig)
 
 
@@ -1043,7 +1117,240 @@ def compute_flux_errors(tr: Tractor) -> dict[tuple[int, str], float]:
     return out
 
 
+def _get_sersic_n(src, default=np.nan):
+    if not hasattr(src, "sersicindex"):
+        return default
+    si = src.sersicindex
+    if hasattr(si, "getValue"):
+        return float(si.getValue())
+    if hasattr(si, "value"):
+        return float(si.value)
+    if hasattr(si, "n"):
+        return float(si.n)
+    return default
+
+
+def _get_shape_params(src):
+    if not hasattr(src, "shape"):
+        return (np.nan, np.nan, np.nan)
+    sh = src.shape
+    re_ = float(getattr(sh, "re", np.nan))
+    ab_ = float(getattr(sh, "ab", np.nan))
+    if hasattr(sh, "phi"):
+        phi_deg = float(getattr(sh, "phi", np.nan))
+    elif hasattr(sh, "theta"):
+        try:
+            phi_deg = float(-np.degrees(sh.theta))
+        except Exception:
+            phi_deg = np.nan
+    else:
+        phi_deg = np.nan
+    if np.isfinite(phi_deg):
+        phi_deg = float(phi_deg % 180.0)
+    return (re_, ab_, phi_deg)
+
+
+def _extract_source_params_to_df(
+    out: pd.DataFrame,
+    i: int,
+    src: Any,
+    col_suffix: str,
+    x0_roi: float,
+    y0_roi: float,
+) -> None:
+    """Extract fitted position/morphology for one source into the output DataFrame.
+
+    col_suffix: "" for multi-band (shared columns), "_{band}" for single-band.
+    """
+    pos = src.getPosition() if hasattr(src, "getPosition") else src.pos
+    out.at[i, f"x_pix_patch{col_suffix}_fit"] = float(pos.x)
+    out.at[i, f"y_pix_patch{col_suffix}_fit"] = float(pos.y)
+    out.at[i, f"x_pix_white{col_suffix}_fit"] = float(pos.x) + float(x0_roi)
+    out.at[i, f"y_pix_white{col_suffix}_fit"] = float(pos.y) + float(y0_roi)
+
+    if isinstance(src, SersicGalaxy):
+        out.at[i, "stype_fit"] = "sersic"
+        out.at[i, f"sersic_n{col_suffix}_fit"] = _get_sersic_n(src)
+    elif isinstance(src, DevGalaxy):
+        out.at[i, "stype_fit"] = "dev"
+    elif isinstance(src, ExpGalaxy):
+        out.at[i, "stype_fit"] = "exp"
+    else:
+        out.at[i, "stype_fit"] = "star"
+        return
+
+    re_, ab_, phi_ = _get_shape_params(src)
+    out.at[i, f"re_pix{col_suffix}_fit"] = re_
+    out.at[i, f"ab{col_suffix}_fit"] = ab_
+    out.at[i, f"phi_deg{col_suffix}_fit"] = phi_
+    if np.isfinite(re_):
+        out.at[i, f"Re{col_suffix}_fit"] = float(re_)
+    if np.isfinite(ab_):
+        out.at[i, f"ELL{col_suffix}_fit"] = float(1.0 - ab_)
+    if np.isfinite(phi_):
+        out.at[i, f"THETA{col_suffix}_fit"] = float(phi_ - 90.0)
+
+
+def _freeze_gaussian_mixture_psfs(tr: Tractor, log: logging.Logger) -> list[str]:
+    """Freeze GaussianMixturePSF image params to avoid ConstrainedOptimizer bounds mismatch."""
+    frozen: list[str] = []
+    for tim in tr.images:
+        try:
+            if isinstance(getattr(tim, "psf", None), GaussianMixturePSF):
+                tim.freezeParam("psf")
+                frozen.append(str(getattr(tim, "name", "")))
+        except Exception as e:
+            log.warning("[PSF] Failed to freeze GaussianMixturePSF params for %s: %s",
+                        str(getattr(tim, "name", "")), str(e))
+    if frozen:
+        log.warning("[PSF] Frozen GaussianMixturePSF image params for optimizer stability in bands: %s",
+                    ",".join(frozen))
+    return frozen
+
+
+def _run_optimizer(
+    tr: Tractor,
+    cfg: PatchRunConfig,
+    log: logging.Logger,
+    log_prefix: str = "",
+) -> tuple[int, bool, bool, float | None]:
+    """Run the Tractor optimization loop. Returns (niters, converged, hit_max_iters, last_dlnp)."""
+    converged = False
+    last_dlnp: float | None = None
+    niters = 0
+    pfx = f"[{log_prefix}] " if log_prefix else ""
+    for it in range(int(cfg.n_opt_iters)):
+        dlnp, _X, _alpha = tr.optimize()
+        niters = it + 1
+        try:
+            last_dlnp = float(dlnp)
+        except Exception:
+            last_dlnp = None
+        log.info("%sopt iter %02d  dlnp=%s", pfx, it, str(dlnp))
+        if dlnp < float(cfg.dlnp_stop):
+            converged = True
+            break
+    margin = max(0, int(getattr(cfg, "flag_maxiter_margin", 0)))
+    hit_max_iters = (not converged) and (niters >= max(1, int(cfg.n_opt_iters) - margin))
+    if hit_max_iters:
+        log.info("%sWARNING: did not converge. niters=%d n_opt_iters=%d margin=%d last_dlnp=%s",
+                 pfx, int(niters), int(cfg.n_opt_iters), int(margin), str(last_dlnp))
+    return niters, converged, hit_max_iters, last_dlnp
+
+
+def _compute_psf_audit_summary(psf_audit: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Derive PSF audit summary fields from per-band psf_audit."""
+    low_star_bands = sorted(
+        b for b, a in psf_audit.items()
+        if isinstance(a.get("fallback_reason", None), str)
+        and str(a["fallback_reason"]).startswith("low-star ePSF")
+    )
+    fallback_bands = sorted(b for b, a in psf_audit.items() if not bool(a.get("used_epsf", False)))
+    fallback_reason_by_band = {
+        b: a.get("fallback_reason", None)
+        for b, a in psf_audit.items() if not bool(a.get("used_epsf", False))
+    }
+    used_epsf_bands = sorted(b for b, a in psf_audit.items() if bool(a.get("used_epsf", False)))
+    return dict(
+        low_star_bands=low_star_bands,
+        fallback_bands=fallback_bands,
+        fallback_reason_by_band=fallback_reason_by_band,
+        used_epsf_bands=used_epsf_bands,
+    )
+
+
+def _populate_psf_audit_columns(
+    out: pd.DataFrame,
+    cfg: PatchRunConfig,
+    audit: dict[str, Any],
+    psf_frozen_bands: list[str],
+    fallback_reason_by_band: dict[str, Any],
+) -> None:
+    """Write PSF audit columns into the output DataFrame."""
+    out["psf_min_epsf_nstars_for_use"] = int(getattr(cfg, "min_epsf_nstars_for_use", 5))
+    out["psf_used_epsf_band_count"] = int(len(audit["used_epsf_bands"]))
+    out["psf_fallback_band_count"] = int(len(audit["fallback_bands"]))
+    out["psf_low_star_band_count"] = int(len(audit["low_star_bands"]))
+    out["psf_fallback_bands"] = ",".join(audit["fallback_bands"])
+    out["psf_low_star_bands"] = ",".join(audit["low_star_bands"])
+    out["psf_frozen_bands_for_optimizer"] = ",".join(sorted(b for b in psf_frozen_bands if b))
+    out["psf_fallback_reasons_json"] = json.dumps(fallback_reason_by_band, sort_keys=True)
+
+
+def _build_visualization_tractor(
+    *,
+    per_filter_patch: dict,
+    psf_by_band: dict[str, Any],
+    all_band_tractors: dict[str, Tractor],
+    bandnames: list[str],
+    n_sources: int,
+    cfg: PatchRunConfig,
+    log: logging.Logger,
+) -> Tractor | None:
+    """Build a combined multi-band Tractor for visualization after single-band fitting.
+
+    Uses the first band's fitted position/shape as reference and each band's fitted
+    flux.  The model will be exact for the reference band; for other bands positions
+    may differ by < 1 pix which is negligible for diagnostic plots.
+    """
+    try:
+        all_images, _ = build_tractor_images_from_per_filter_patch(
+            per_filter_patch=per_filter_patch, psf_by_filt=psf_by_band, use_sky_sigma=True)
+
+        ref_band = bandnames[0]
+        vis_catalog: list[Any] = []
+        for i in range(n_sources):
+            ref_src = all_band_tractors[ref_band].catalog[i]
+            ref_pos = ref_src.getPosition() if hasattr(ref_src, "getPosition") else ref_src.pos
+            pos = PixPos(float(ref_pos.x), float(ref_pos.y))
+
+            fluxes_dict: dict[str, float] = {}
+            for bn in bandnames:
+                try:
+                    bx = all_band_tractors[bn].catalog[i].getBrightness()
+                    fluxes_dict[bn] = float(bx.getFlux(bn))
+                except Exception:
+                    fluxes_dict[bn] = float(cfg.eps_flux)
+            bright = Fluxes(**fluxes_dict)
+
+            if isinstance(ref_src, SersicGalaxy):
+                re_, ab_, phi_ = _get_shape_params(ref_src)
+                shape = EllipseESoft.fromRAbPhi(
+                    max(float(re_), 0.1) if np.isfinite(re_) else float(cfg.re_fallback_pix),
+                    float(ab_) if np.isfinite(ab_) else 0.8,
+                    float(phi_) if np.isfinite(phi_) else 0.0,
+                )
+                sn_val = _get_sersic_n(ref_src, default=float(cfg.sersic_n_init))
+                vis_catalog.append(SersicGalaxy(pos, bright, shape, SersicIndex(sn_val)))
+            elif isinstance(ref_src, DevGalaxy):
+                re_, ab_, phi_ = _get_shape_params(ref_src)
+                shape = EllipseESoft.fromRAbPhi(
+                    max(float(re_), 0.1) if np.isfinite(re_) else float(cfg.re_fallback_pix),
+                    float(ab_) if np.isfinite(ab_) else 0.8,
+                    float(phi_) if np.isfinite(phi_) else 0.0,
+                )
+                vis_catalog.append(DevGalaxy(pos, bright, shape))
+            elif isinstance(ref_src, ExpGalaxy):
+                re_, ab_, phi_ = _get_shape_params(ref_src)
+                shape = EllipseESoft.fromRAbPhi(
+                    max(float(re_), 0.1) if np.isfinite(re_) else float(cfg.re_fallback_pix),
+                    float(ab_) if np.isfinite(ab_) else 0.8,
+                    float(phi_) if np.isfinite(phi_) else 0.0,
+                )
+                vis_catalog.append(ExpGalaxy(pos, bright, shape))
+            else:
+                vis_catalog.append(PointSource(pos, bright))
+
+        return Tractor(all_images, vis_catalog)
+    except Exception as e:
+        log.warning("Failed to build visualization Tractor: %s", str(e))
+        return None
+
+
 def run_patch(*, payload: dict, epsf_root: Path, outdir: Path, cfg: PatchRunConfig) -> pd.DataFrame:
+    global _PATCH_PLOT_DPI
+    _PATCH_PLOT_DPI = int(getattr(cfg, "plot_dpi", 150))
+
     meta = payload.get("meta", {}) or {}
     tag = _patch_tag_from_meta(meta)
     patch_out = outdir / tag
@@ -1051,7 +1358,8 @@ def run_patch(*, payload: dict, epsf_root: Path, outdir: Path, cfg: PatchRunConf
     _ensure_dir(patch_out / "cutouts")
 
     log = _make_logger(patch_out, tag)
-    log.info("Starting patch run: %s", tag)
+    log.info("Starting patch run: %s  (multi_band_simultaneous=%s)", tag,
+             str(cfg.enable_multi_band_simultaneous_fitting))
 
     (x0_roi, x1_roi, y0_roi, y1_roi) = _roi_bbox_from_meta(meta)
     meta = dict(meta)
@@ -1074,249 +1382,248 @@ def run_patch(*, payload: dict, epsf_root: Path, outdir: Path, cfg: PatchRunConf
         cfg=cfg,
         log=log,
     )
-    tractor_images, _image_data = build_tractor_images_from_per_filter_patch(per_filter_patch=per_filter_patch, psf_by_filt=psf_by_band, use_sky_sigma=True)
-    catalog = build_catalog_from_cat_patch(cat_patch, tractor_images, cfg)
 
-    tr = Tractor(tractor_images, catalog, optimizer=ConstrainedOptimizer())
-    tr.thawAllRecursive()
-    # Tractor's constrained optimizer expects bounds arrays to align with thawed
-    # parameter count. For GaussianMixturePSF image params this can mismatch
-    # internally (params > bounds), causing IndexError in optimize().
-    # Keep source params thawed, but freeze image-level GaussianMixturePSF params.
-    psf_frozen_bands: list[str] = []
-    for tim in tr.images:
-        try:
-            psf_obj = getattr(tim, "psf", None)
-            if isinstance(psf_obj, GaussianMixturePSF):
-                tim.freezeParam("psf")
-                psf_frozen_bands.append(str(getattr(tim, "name", "")))
-        except Exception as e:
-            log.warning("[PSF] Failed to freeze GaussianMixturePSF params for %s: %s", str(getattr(tim, "name", "")), str(e))
-    if psf_frozen_bands:
-        log.warning(
-            "[PSF] Frozen GaussianMixturePSF image params for optimizer stability in bands: %s",
-            ",".join(psf_frozen_bands),
-        )
-
-    converged = False
-    last_dlnp: float | None = None
-    niters = 0
-    for it in range(int(cfg.n_opt_iters)):
-        dlnp, _X, _alpha = tr.optimize()
-        niters = it + 1
-        try:
-            last_dlnp = float(dlnp)
-        except Exception:
-            last_dlnp = None
-        log.info("opt iter %02d  dlnp=%s", it, str(dlnp))
-        if dlnp < float(cfg.dlnp_stop):
-            converged = True
-            break
-
-    margin = max(0, int(getattr(cfg, "flag_maxiter_margin", 0)))
-    hit_max_iters = (not converged) and (niters >= max(1, int(cfg.n_opt_iters) - margin))
-    if hit_max_iters:
-        log.info(
-            "WARNING: did not converge before max iters. niters=%d n_opt_iters=%d margin=%d last_dlnp=%s",
-            int(niters),
-            int(cfg.n_opt_iters),
-            int(margin),
-            str(last_dlnp),
-        )
-
+    audit = _compute_psf_audit_summary(psf_audit)
     meta = dict(meta)
-    low_star_bands = sorted(
-        [
-            b
-            for b, a in psf_audit.items()
-            if isinstance(a.get("fallback_reason", None), str)
-            and str(a.get("fallback_reason")).startswith("low-star ePSF")
-        ]
-    )
-    fallback_bands = sorted([b for b, a in psf_audit.items() if not bool(a.get("used_epsf", False))])
-    fallback_reason_by_band = {b: a.get("fallback_reason", None) for b, a in psf_audit.items() if not bool(a.get("used_epsf", False))}
-    used_epsf_bands = sorted([b for b, a in psf_audit.items() if bool(a.get("used_epsf", False))])
     meta["psf_min_epsf_nstars_for_use"] = int(getattr(cfg, "min_epsf_nstars_for_use", 5))
-    meta["psf_used_epsf_band_count"] = int(len(used_epsf_bands))
-    meta["psf_fallback_band_count"] = int(len(fallback_bands))
-    meta["psf_low_star_band_count"] = int(len(low_star_bands))
-    meta["psf_fallback_bands"] = fallback_bands
-    meta["psf_low_star_bands"] = low_star_bands
-    meta["psf_frozen_bands_for_optimizer"] = sorted([b for b in psf_frozen_bands if b])
+    meta["psf_used_epsf_band_count"] = int(len(audit["used_epsf_bands"]))
+    meta["psf_fallback_band_count"] = int(len(audit["fallback_bands"]))
+    meta["psf_low_star_band_count"] = int(len(audit["low_star_bands"]))
+    meta["psf_fallback_bands"] = audit["fallback_bands"]
+    meta["psf_low_star_bands"] = audit["low_star_bands"]
     meta["psf_audit"] = psf_audit
-    meta["opt_niters"] = int(niters)
-    meta["opt_converged"] = bool(converged)
-    meta["opt_hit_max_iters"] = bool(hit_max_iters)
-    meta["opt_last_dlnp"] = (float(last_dlnp) if last_dlnp is not None and np.isfinite(last_dlnp) else None)
-    (patch_out / "meta.json").write_text(json.dumps(meta, indent=2, default=str))
+    meta["enable_multi_band_simultaneous_fitting"] = bool(cfg.enable_multi_band_simultaneous_fitting)
+
+    # ------------------------------------------------------------------
+    #  Multi-band simultaneous fitting (default / original behaviour)
+    # ------------------------------------------------------------------
+    if cfg.enable_multi_band_simultaneous_fitting:
+        tractor_images, _image_data = build_tractor_images_from_per_filter_patch(
+            per_filter_patch=per_filter_patch, psf_by_filt=psf_by_band, use_sky_sigma=True)
+        catalog = build_catalog_from_cat_patch(cat_patch, tractor_images, cfg)
+
+        tr = Tractor(tractor_images, catalog, optimizer=ConstrainedOptimizer())
+        tr.thawAllRecursive()
+        psf_frozen_bands = _freeze_gaussian_mixture_psfs(tr, log)
+
+        niters, converged, hit_max_iters, last_dlnp = _run_optimizer(tr, cfg, log)
+
+        meta["psf_frozen_bands_for_optimizer"] = sorted(b for b in psf_frozen_bands if b)
+        meta["opt_niters"] = int(niters)
+        meta["opt_converged"] = bool(converged)
+        meta["opt_hit_max_iters"] = bool(hit_max_iters)
+        meta["opt_last_dlnp"] = float(last_dlnp) if last_dlnp is not None and np.isfinite(last_dlnp) else None
+        (patch_out / "meta.json").write_text(json.dumps(meta, indent=2, default=str))
+
+        out = cat_patch.copy()
+        out["patch_tag"] = str(tag)
+        out["epsf_tag"] = str(epsf_tag)
+        _populate_psf_audit_columns(out, cfg, audit, psf_frozen_bands, audit["fallback_reason_by_band"])
+        out["opt_niters"] = int(niters)
+        out["opt_converged"] = bool(converged)
+        out["opt_hit_max_iters"] = bool(hit_max_iters)
+        out["opt_last_dlnp"] = float(last_dlnp) if last_dlnp is not None and np.isfinite(last_dlnp) else np.nan
+        out["x_pix_patch_fit"] = np.nan
+        out["y_pix_patch_fit"] = np.nan
+        out["x_pix_white_fit"] = np.nan
+        out["y_pix_white_fit"] = np.nan
+        out["RA_fit"] = np.nan
+        out["DEC_fit"] = np.nan
+        out["stype_fit"] = ""
+        out["sersic_n_fit"] = np.nan
+        out["re_pix_fit"] = np.nan
+        out["ab_fit"] = np.nan
+        out["phi_deg_fit"] = np.nan
+        out["ELL_fit"] = np.nan
+        out["Re_fit"] = np.nan
+        out["THETA_fit"] = np.nan
+
+        bandnames = [str(getattr(tim, "name", f"band{i}")) for i, tim in enumerate(tractor_images)]
+        for bn in bandnames:
+            out[f"FLUX_{bn}_fit"] = np.nan
+            out[f"FLUXERR_{bn}_fit"] = np.nan
+
+        for i, src in enumerate(tr.catalog):
+            bx = src.getBrightness() if hasattr(src, "getBrightness") else src.brightness
+            _extract_source_params_to_df(out, i, src, "", x0_roi, y0_roi)
+            for bn in bandnames:
+                try:
+                    out.at[i, f"FLUX_{bn}_fit"] = float(bx.getFlux(bn))
+                except Exception:
+                    out.at[i, f"FLUX_{bn}_fit"] = np.nan
+
+        try:
+            ferr = compute_flux_errors(tr)
+            for (sid, bn), fe in ferr.items():
+                if 0 <= sid < len(out):
+                    out.at[sid, f"FLUXERR_{bn}_fit"] = float(fe)
+            log.info("Computed flux errors for %d (source,band) pairs", len(ferr))
+        except Exception as e:
+            log.info("WARNING: flux error computation failed: %s", str(e))
+
+        out_csv = patch_out / f"{tag}_cat_fit.csv"
+        out.to_csv(out_csv, index=False)
+        log.info("Wrote fitted catalog: %s", str(out_csv))
+
+        if cfg.save_cutouts:
+            save_source_montages(
+                tr=tr, cat_patch=cat_patch, meta=meta,
+                outdir=patch_out / "cutouts",
+                size=int(cfg.cutout_size_pix), per_band_scale=True,
+                max_sources=cfg.cutout_max_sources, start=int(cfg.cutout_start),
+                data_p_lo=float(cfg.cutout_data_p_lo), data_p_hi=float(cfg.cutout_data_p_hi),
+                model_p_lo=float(cfg.cutout_model_p_lo), model_p_hi=float(cfg.cutout_model_p_hi),
+                resid_p_abs=float(cfg.cutout_resid_p_abs), log=log,
+            )
+
+        if getattr(cfg, "save_patch_overview", False):
+            try:
+                save_patch_overview(
+                    tr=tr, cat_patch=cat_patch, meta=meta,
+                    outpath=patch_out / "patch_overview.png",
+                    data_p_lo=float(cfg.cutout_data_p_lo), data_p_hi=float(cfg.cutout_data_p_hi),
+                    model_p_lo=float(cfg.cutout_model_p_lo), model_p_hi=float(cfg.cutout_model_p_hi),
+                    resid_p_abs=float(cfg.cutout_resid_p_abs), log=log,
+                )
+            except Exception as e:
+                log.info("WARNING: patch overview failed: %s", str(e))
+
+        log.info("Done patch run: %s", tag)
+        return out
+
+    # ------------------------------------------------------------------
+    #  Single-band independent fitting
+    # ------------------------------------------------------------------
+    bandnames = sorted(str(b) for b in per_filter_patch.keys())
+    log.info("Single-band fitting mode: fitting %d bands independently: %s",
+             len(bandnames), ", ".join(bandnames))
 
     out = cat_patch.copy()
     out["patch_tag"] = str(tag)
     out["epsf_tag"] = str(epsf_tag)
-    out["psf_min_epsf_nstars_for_use"] = int(getattr(cfg, "min_epsf_nstars_for_use", 5))
-    out["psf_used_epsf_band_count"] = int(len(used_epsf_bands))
-    out["psf_fallback_band_count"] = int(len(fallback_bands))
-    out["psf_low_star_band_count"] = int(len(low_star_bands))
-    out["psf_fallback_bands"] = ",".join(fallback_bands)
-    out["psf_low_star_bands"] = ",".join(low_star_bands)
-    out["psf_frozen_bands_for_optimizer"] = ",".join(sorted([b for b in psf_frozen_bands if b]))
-    out["psf_fallback_reasons_json"] = json.dumps(fallback_reason_by_band, sort_keys=True)
-    out["opt_niters"] = int(niters)
-    out["opt_converged"] = bool(converged)
-    out["opt_hit_max_iters"] = bool(hit_max_iters)
-    out["opt_last_dlnp"] = float(last_dlnp) if last_dlnp is not None and np.isfinite(last_dlnp) else np.nan
-    out["x_pix_patch_fit"] = np.nan
-    out["y_pix_patch_fit"] = np.nan
-    out["x_pix_white_fit"] = np.nan
-    out["y_pix_white_fit"] = np.nan
-    out["RA_fit"] = np.nan
-    out["DEC_fit"] = np.nan
+    _populate_psf_audit_columns(out, cfg, audit, [], audit["fallback_reason_by_band"])
     out["stype_fit"] = ""
-    out["sersic_n_fit"] = np.nan
-    out["re_pix_fit"] = np.nan
-    out["ab_fit"] = np.nan
-    out["phi_deg_fit"] = np.nan
-    out["ELL_fit"] = np.nan
-    out["Re_fit"] = np.nan
-    out["THETA_fit"] = np.nan
 
-    bandnames = [str(getattr(tim, "name", f"band{i}")) for i, tim in enumerate(tractor_images)]
     for bn in bandnames:
+        out[f"x_pix_patch_{bn}_fit"] = np.nan
+        out[f"y_pix_patch_{bn}_fit"] = np.nan
+        out[f"x_pix_white_{bn}_fit"] = np.nan
+        out[f"y_pix_white_{bn}_fit"] = np.nan
+        out[f"RA_{bn}_fit"] = np.nan
+        out[f"DEC_{bn}_fit"] = np.nan
+        out[f"sersic_n_{bn}_fit"] = np.nan
+        out[f"re_pix_{bn}_fit"] = np.nan
+        out[f"ab_{bn}_fit"] = np.nan
+        out[f"phi_deg_{bn}_fit"] = np.nan
+        out[f"Re_{bn}_fit"] = np.nan
+        out[f"ELL_{bn}_fit"] = np.nan
+        out[f"THETA_{bn}_fit"] = np.nan
         out[f"FLUX_{bn}_fit"] = np.nan
         out[f"FLUXERR_{bn}_fit"] = np.nan
+        out[f"opt_niters_{bn}"] = 0
+        out[f"opt_converged_{bn}"] = False
+        out[f"opt_hit_max_iters_{bn}"] = False
+        out[f"opt_last_dlnp_{bn}"] = np.nan
 
-    def _get_sersic_n(src, default=np.nan):
-        if not hasattr(src, "sersicindex"):
-            return default
-        si = src.sersicindex
-        if hasattr(si, "getValue"):
-            return float(si.getValue())
-        if hasattr(si, "value"):
-            return float(si.value)
-        if hasattr(si, "n"):
-            return float(si.n)
-        return default
+    all_psf_frozen: list[str] = []
+    all_band_tractors: dict[str, Tractor] = {}
 
-    def _get_shape_params(src):
-        if not hasattr(src, "shape"):
-            return (np.nan, np.nan, np.nan)
-        sh = src.shape
-        re_ = float(getattr(sh, "re", np.nan))
-        ab_ = float(getattr(sh, "ab", np.nan))
-        if hasattr(sh, "phi"):
-            phi_deg = float(getattr(sh, "phi", np.nan))
-        elif hasattr(sh, "theta"):
-            try:
-                phi_deg = float(-np.degrees(sh.theta))
-            except Exception:
-                phi_deg = np.nan
-        else:
-            phi_deg = np.nan
-        if np.isfinite(phi_deg):
-            phi_deg = float(phi_deg % 180.0)
-        return (re_, ab_, phi_deg)
+    for bn in bandnames:
+        log.info("=== Fitting band: %s ===", bn)
 
-    for i, src in enumerate(tr.catalog):
-        pos = src.getPosition() if hasattr(src, "getPosition") else src.pos
-        bx = src.getBrightness() if hasattr(src, "getBrightness") else src.brightness
-        out.at[i, "x_pix_patch_fit"] = float(pos.x)
-        out.at[i, "y_pix_patch_fit"] = float(pos.y)
-        out.at[i, "x_pix_white_fit"] = float(pos.x) + float(x0_roi)
-        out.at[i, "y_pix_white_fit"] = float(pos.y) + float(y0_roi)
+        single_band_patch = {bn: per_filter_patch[bn]}
+        band_images, _ = build_tractor_images_from_per_filter_patch(
+            per_filter_patch=single_band_patch, psf_by_filt=psf_by_band, use_sky_sigma=True)
+        band_catalog = build_catalog_from_cat_patch(cat_patch, band_images, cfg)
 
-        if isinstance(src, SersicGalaxy):
-            out.at[i, "stype_fit"] = "sersic"
-            out.at[i, "sersic_n_fit"] = _get_sersic_n(src)
-            re_, ab_, phi_ = _get_shape_params(src)
-            out.at[i, "re_pix_fit"] = re_
-            out.at[i, "ab_fit"] = ab_
-            out.at[i, "phi_deg_fit"] = phi_
-            if np.isfinite(re_):
-                out.at[i, "Re_fit"] = float(re_)
-            if np.isfinite(ab_):
-                out.at[i, "ELL_fit"] = float(1.0 - ab_)
-            if np.isfinite(phi_):
-                out.at[i, "THETA_fit"] = float(phi_ - 90.0)
-        elif isinstance(src, DevGalaxy):
-            out.at[i, "stype_fit"] = "dev"
-            re_, ab_, phi_ = _get_shape_params(src)
-            out.at[i, "re_pix_fit"] = re_
-            out.at[i, "ab_fit"] = ab_
-            out.at[i, "phi_deg_fit"] = phi_
-            if np.isfinite(re_):
-                out.at[i, "Re_fit"] = float(re_)
-            if np.isfinite(ab_):
-                out.at[i, "ELL_fit"] = float(1.0 - ab_)
-            if np.isfinite(phi_):
-                out.at[i, "THETA_fit"] = float(phi_ - 90.0)
-        elif isinstance(src, ExpGalaxy):
-            out.at[i, "stype_fit"] = "exp"
-            re_, ab_, phi_ = _get_shape_params(src)
-            out.at[i, "re_pix_fit"] = re_
-            out.at[i, "ab_fit"] = ab_
-            out.at[i, "phi_deg_fit"] = phi_
-            if np.isfinite(re_):
-                out.at[i, "Re_fit"] = float(re_)
-            if np.isfinite(ab_):
-                out.at[i, "ELL_fit"] = float(1.0 - ab_)
-            if np.isfinite(phi_):
-                out.at[i, "THETA_fit"] = float(phi_ - 90.0)
-        else:
-            out.at[i, "stype_fit"] = "star"
+        band_tr = Tractor(band_images, band_catalog, optimizer=ConstrainedOptimizer())
+        band_tr.thawAllRecursive()
+        frozen = _freeze_gaussian_mixture_psfs(band_tr, log)
+        all_psf_frozen.extend(frozen)
 
-        for bn in bandnames:
+        niters, converged, hit_max_iters, last_dlnp = _run_optimizer(band_tr, cfg, log, log_prefix=bn)
+
+        out[f"opt_niters_{bn}"] = int(niters)
+        out[f"opt_converged_{bn}"] = bool(converged)
+        out[f"opt_hit_max_iters_{bn}"] = bool(hit_max_iters)
+        out[f"opt_last_dlnp_{bn}"] = float(last_dlnp) if last_dlnp is not None and np.isfinite(last_dlnp) else np.nan
+
+        for i, src in enumerate(band_tr.catalog):
+            bx = src.getBrightness() if hasattr(src, "getBrightness") else src.brightness
+            _extract_source_params_to_df(out, i, src, f"_{bn}", x0_roi, y0_roi)
             try:
                 out.at[i, f"FLUX_{bn}_fit"] = float(bx.getFlux(bn))
             except Exception:
                 out.at[i, f"FLUX_{bn}_fit"] = np.nan
 
-    try:
-        ferr = compute_flux_errors(tr)
-        for (sid, bn), fe in ferr.items():
-            if 0 <= sid < len(out):
-                out.at[sid, f"FLUXERR_{bn}_fit"] = float(fe)
-        log.info("Computed flux errors for %d (source,band) pairs", len(ferr))
-    except Exception as e:
-        log.info("WARNING: flux error computation failed: %s", str(e))
+        try:
+            ferr = compute_flux_errors(band_tr)
+            for (sid, b), fe in ferr.items():
+                if 0 <= sid < len(out):
+                    out.at[sid, f"FLUXERR_{b}_fit"] = float(fe)
+            log.info("[%s] Computed flux errors for %d source(s)", bn, len(ferr))
+        except Exception as e:
+            log.info("[%s] WARNING: flux error computation failed: %s", bn, str(e))
+
+        all_band_tractors[bn] = band_tr
+
+    out["psf_frozen_bands_for_optimizer"] = ",".join(sorted(set(b for b in all_psf_frozen if b)))
+    meta["psf_frozen_bands_for_optimizer"] = sorted(set(b for b in all_psf_frozen if b))
+    (patch_out / "meta.json").write_text(json.dumps(meta, indent=2, default=str))
 
     out_csv = patch_out / f"{tag}_cat_fit.csv"
     out.to_csv(out_csv, index=False)
     log.info("Wrote fitted catalog: %s", str(out_csv))
 
-    if cfg.save_cutouts:
-        save_source_montages(
-            tr=tr,
-            cat_patch=cat_patch,
-            meta=meta,
-            outdir=patch_out / "cutouts",
-            size=int(cfg.cutout_size_pix),
-            per_band_scale=True,
-            max_sources=cfg.cutout_max_sources,
-            start=int(cfg.cutout_start),
-            data_p_lo=float(cfg.cutout_data_p_lo),
-            data_p_hi=float(cfg.cutout_data_p_hi),
-            model_p_lo=float(cfg.cutout_model_p_lo),
-            model_p_hi=float(cfg.cutout_model_p_hi),
-            resid_p_abs=float(cfg.cutout_resid_p_abs),
+    if cfg.save_cutouts or getattr(cfg, "save_patch_overview", False):
+        vis_tr = _build_visualization_tractor(
+            per_filter_patch=per_filter_patch,
+            psf_by_band=psf_by_band,
+            all_band_tractors=all_band_tractors,
+            bandnames=bandnames,
+            n_sources=len(cat_patch),
+            cfg=cfg,
             log=log,
         )
-
-    if getattr(cfg, "save_patch_overview", False):
-        try:
-            save_patch_overview(
-                tr=tr,
-                cat_patch=cat_patch,
-                meta=meta,
-                outpath=patch_out / "patch_overview.png",
-                data_p_lo=float(cfg.cutout_data_p_lo),
-                data_p_hi=float(cfg.cutout_data_p_hi),
-                model_p_lo=float(cfg.cutout_model_p_lo),
-                model_p_hi=float(cfg.cutout_model_p_hi),
-                resid_p_abs=float(cfg.cutout_resid_p_abs),
-                log=log,
-            )
-        except Exception as e:
-            log.info("WARNING: patch overview failed: %s", str(e))
+        if vis_tr is not None:
+            exact_models = [
+                np.asarray(all_band_tractors[bn].getModelImage(0), dtype=np.float32)
+                for bn in bandnames
+            ]
+            per_band_positions = [
+                (
+                    np.array([float((s.getPosition() if hasattr(s, "getPosition") else s.pos).x)
+                              for s in all_band_tractors[bn].catalog], dtype=float),
+                    np.array([float((s.getPosition() if hasattr(s, "getPosition") else s.pos).y)
+                              for s in all_band_tractors[bn].catalog], dtype=float),
+                )
+                for bn in bandnames
+            ]
+            if cfg.save_cutouts:
+                save_source_montages(
+                    tr=vis_tr, cat_patch=cat_patch, meta=meta,
+                    outdir=patch_out / "cutouts",
+                    size=int(cfg.cutout_size_pix), per_band_scale=True,
+                    max_sources=cfg.cutout_max_sources, start=int(cfg.cutout_start),
+                    data_p_lo=float(cfg.cutout_data_p_lo), data_p_hi=float(cfg.cutout_data_p_hi),
+                    model_p_lo=float(cfg.cutout_model_p_lo), model_p_hi=float(cfg.cutout_model_p_hi),
+                    resid_p_abs=float(cfg.cutout_resid_p_abs), log=log,
+                    model_by_band=exact_models,
+                    per_band_fit_positions=per_band_positions,
+                )
+            if getattr(cfg, "save_patch_overview", False):
+                try:
+                    save_patch_overview(
+                        tr=vis_tr, cat_patch=cat_patch, meta=meta,
+                        outpath=patch_out / "patch_overview.png",
+                        data_p_lo=float(cfg.cutout_data_p_lo), data_p_hi=float(cfg.cutout_data_p_hi),
+                        model_p_lo=float(cfg.cutout_model_p_lo), model_p_hi=float(cfg.cutout_model_p_hi),
+                        resid_p_abs=float(cfg.cutout_resid_p_abs), log=log,
+                        model_by_band=exact_models,
+                        per_band_fit_positions=per_band_positions,
+                    )
+                except Exception as e:
+                    log.info("WARNING: patch overview failed: %s", str(e))
 
     log.info("Done patch run: %s", tag)
     return out
@@ -1327,6 +1634,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--inputs", required=True, help="Path to patch input .pkl.gz")
     ap.add_argument("--epsf-root", required=True, help="ePSF root directory")
     ap.add_argument("--outdir", required=True, help="Output base directory")
+    ap.add_argument("--no-enable-multi-band-simultaneous-fitting", action="store_true",
+                    help="Fit each band independently instead of simultaneous multi-band fitting")
     ap.add_argument("--no-cutouts", action="store_true", help="Disable montage saving")
     ap.add_argument("--no-patch-overview", action="store_true", help="Disable per-patch overview plot")
     ap.add_argument("--cutout-size", type=int, default=100)
@@ -1355,10 +1664,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--fallback-stamp-radius-pix", type=float, default=25.0)
     ap.add_argument("--moffat-beta", type=float, default=3.5)
     ap.add_argument("--moffat-radius-pix", type=float, default=25.0)
+    ap.add_argument("--plot-dpi", type=int, default=150)
     args = ap.parse_args(argv)
 
     payload = load_patch_inputs(args.inputs)
     cfg = PatchRunConfig(
+        enable_multi_band_simultaneous_fitting=not args.no_enable_multi_band_simultaneous_fitting,
         save_cutouts=not args.no_cutouts,
         save_patch_overview=not args.no_patch_overview,
         cutout_size_pix=int(args.cutout_size),
@@ -1387,6 +1698,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         fallback_stamp_radius_pix=float(args.fallback_stamp_radius_pix),
         moffat_beta=float(args.moffat_beta),
         moffat_radius_pix=float(args.moffat_radius_pix),
+        plot_dpi=int(args.plot_dpi),
     )
 
     run_patch(payload=payload, epsf_root=Path(args.epsf_root), outdir=Path(args.outdir), cfg=cfg)

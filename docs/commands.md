@@ -6,12 +6,13 @@ All pipeline commands require `--config /path/to/config.yaml` and execute one or
 
 | Command | Stages executed | Description |
 |---------|----------------|-------------|
-| `run` | all 6 stages | Full pipeline: load → ePSF → patches → patch inputs → run patches → merge. |
+| `run` | all stages | Full pipeline: load → [augment Gaia] → ePSF → patches → patch inputs → run patches → merge → [compute ZP]. Stages in brackets run when `zp.enabled: true`. |
 | `run-epsf` | load + ePSF | Load inputs, validate, and build ePSF products. Useful for iterating on ePSF parameters. |
 | `build-patches` | load + patches | Load inputs and generate patch geometry definitions. |
 | `build-patch-inputs` | load + patches + payloads | Load inputs, build patches, and write per-patch data payloads. |
 | `run-patches` | run patches only | Run Tractor fitting subprocesses on **existing** patch payloads. Does not reload inputs. |
 | `merge` | merge only | Merge **existing** patch fit outputs into the final catalog. Does not reload inputs. |
+| `compute-zp` | ZP only | Compute zero-point calibration on the **existing** merged catalog. Adds `MAG_*_fit` and `MAGERR_*_fit` columns. |
 
 ### Usage
 
@@ -22,6 +23,7 @@ tract7dt build-patches --config /path/to/config.yaml
 tract7dt build-patch-inputs --config /path/to/config.yaml
 tract7dt run-patches --config /path/to/config.yaml
 tract7dt merge --config /path/to/config.yaml
+tract7dt compute-zp --config /path/to/config.yaml
 ```
 
 ### Stage Dependencies
@@ -36,6 +38,7 @@ Some commands depend on outputs from earlier stages:
 | `build-patch-inputs` | Nothing (loads inputs fresh; also builds patches). |
 | `run-patches` | Patch payloads in `outputs.patch_inputs_dir` and ePSF products in `outputs.epsf_dir`. |
 | `merge` | Per-patch fit CSVs in `outputs.tractor_out_dir`. |
+| `compute-zp` | Merged catalog at `outputs.final_catalog` and GaiaXP CSV at `inputs.gaiaxp_synphot_csv`. |
 
 ### Typical Iteration Patterns
 
@@ -57,6 +60,13 @@ tract7dt merge --config config.yaml
 
 ```bash
 tract7dt merge --config config.yaml
+```
+
+**Re-compute ZP with different clipping parameters:**
+
+```bash
+# Edit config.yaml (e.g. change zp.clip_sigma)
+tract7dt compute-zp --config config.yaml
 ```
 
 **Test ePSF quality before running the full pipeline:**
@@ -95,6 +105,6 @@ See [Sample Data](sample-data.md) for download behavior, progress display, and u
 
 ## Logging Behavior
 
-- **Pipeline commands** (`run`, `run-epsf`, `build-patches`, `build-patch-inputs`, `run-patches`, `merge`) apply the `logging.*` section from the YAML config after loading.
+- **Pipeline commands** (`run`, `run-epsf`, `build-patches`, `build-patch-inputs`, `run-patches`, `merge`, `compute-zp`) apply the `logging.*` section from the YAML config after loading.
 - **`download-sample`** does not read `--config`; it uses an independent logging setup.
 - **`dump-config`** does not read `--config`; it only writes the template file.

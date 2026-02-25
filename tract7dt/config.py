@@ -58,6 +58,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "file": None,
         "format": "%(asctime)s | %(name)s | %(levelname)s | %(message)s",
     },
+    "plotting": {
+        "dpi": 300,
+    },
     "performance": {
         "frame_prep_workers": "auto",
         "white_stack_workers": "auto",
@@ -106,6 +109,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "keep_payloads_in_memory": False,
     },
     "patch_run": {
+        "enable_multi_band_simultaneous_fitting": True,
         "python_exe": "python",
         "resume": False,
         "max_workers": 32,
@@ -146,6 +150,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "merge": {
         "pattern": "*_cat_fit.csv",
         "wcs_fits": None,
+    },
+    "zp": {
+        "enabled": False,
+        "gaia_mag_min": 8.0,
+        "gaia_mag_max": 18.0,
+        "match_radius_arcsec": 3.0,
+        "min_box_size_pix": 1000,
+        "clip_sigma": 3.0,
+        "clip_max_iters": 10,
     },
 }
 

@@ -268,6 +268,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--threads-per-process", type=int, default=1)
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--python", default=os.sys.executable)
+    ap.add_argument("--no-enable-multi-band-simultaneous-fitting", action="store_true",
+                    help="Fit each band independently instead of simultaneous multi-band fitting")
     ap.add_argument("--no-cutouts", action="store_true")
     ap.add_argument("--no-patch-overview", action="store_true")
     ap.add_argument("--cutout-size", type=int, default=100)
@@ -296,6 +298,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--fallback-stamp-radius-pix", type=float, default=25.0)
     ap.add_argument("--moffat-beta", type=float, default=3.5)
     ap.add_argument("--moffat-radius-pix", type=float, default=25.0)
+    ap.add_argument("--plot-dpi", type=int, default=150)
     args = ap.parse_args(argv)
 
     extra_args: list[str] = [
@@ -349,6 +352,8 @@ def main(argv: list[str] | None = None) -> int:
         str(float(args.moffat_beta)),
         "--moffat-radius-pix",
         str(float(args.moffat_radius_pix)),
+        "--plot-dpi",
+        str(int(args.plot_dpi)),
     ]
     if args.cutout_max_sources is not None:
         extra_args.extend(["--cutout-max-sources", str(int(args.cutout_max_sources))])
@@ -356,6 +361,8 @@ def main(argv: list[str] | None = None) -> int:
         extra_args.append("--no-cutouts")
     if args.no_patch_overview:
         extra_args.append("--no-patch-overview")
+    if args.no_enable_multi_band_simultaneous_fitting:
+        extra_args.append("--no-enable-multi-band-simultaneous-fitting")
     run_subprocesses(
         patch_input_dir=Path(args.patch_input_dir),
         epsf_root=Path(args.epsf_root),

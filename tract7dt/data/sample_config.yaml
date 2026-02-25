@@ -61,6 +61,9 @@ logging:
   file: null                           # Optional log file path. null -> console only.
   format: "%(asctime)s | %(name)s | %(levelname)s | %(message)s"  # Log line format.
 
+plotting:
+  dpi: 300                             # DPI for all diagnostic PNG plots.
+
 performance:
   frame_prep_workers: "auto"           # Workers for per-frame loading/preparation in load_inputs ("auto" or integer).
   white_stack_workers: "auto"          # Workers for white-stack row-chunk accumulation ("auto" or integer).
@@ -109,6 +112,7 @@ patch_inputs:
   keep_payloads_in_memory: false       # Keep payloads in RAM.
 
 patch_run:
+  enable_multi_band_simultaneous_fitting: true  # true: fit all bands simultaneously (shared position/shape, per-band flux). false: fit each band independently (per-band position/shape/flux).
   python_exe: "python"                 # Python executable for subprocess.
   resume: false                        # Skip patches with existing outputs. Be careful with this=true especially when you re-run the pipeline with altered config parameters, because it will skip the patches that have already been run.
   max_workers: 32                      # Subprocess workers.
@@ -149,3 +153,12 @@ moffat_psf:
 merge:
   pattern: "*_cat_fit.csv"             # Patch catalog glob.
   wcs_fits: null                       # Optional FITS for RA_fit/DEC_fit.
+
+zp:
+  enabled: true                       # Enable zero-point calibration using GaiaXP synphot sources.
+  gaia_mag_min: 8.0                   # Minimum phot_g_mean_mag for Gaia source selection.
+  gaia_mag_max: 18.0                   # Maximum phot_g_mean_mag for Gaia source selection.
+  match_radius_arcsec: 3.0             # RA/DEC match radius for deduplication against input catalog.
+  min_box_size_pix: 1000               # Minimum side length (pixels) of the Gaia selection bounding box.
+  clip_sigma: 3.0                      # MAD-based sigma clipping threshold for ZP computation.
+  clip_max_iters: 10                   # Maximum sigma-clipping iterations.

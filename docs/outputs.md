@@ -37,6 +37,12 @@ work_dir/
 │   ├── white_before_crop.png
 │   ├── white_after_crop.png
 │   └── white_overlay.png
+├── ZP/                       # Zero-point calibration (if zp.enabled)
+│   ├── input_catalog_*_with_Gaia.csv  # Augmented input catalog
+│   ├── gaia_augmentation_overlay.png  # Source selection overlay
+│   ├── zp_vs_mag__<band>.png         # Per-band ZP diagnostic plots
+│   ├── zp_summary.csv                # Per-band ZP summary
+│   └── zp_all_bands__per_object.csv  # Per-star ZP values
 └── output_catalog.csv        # Final merged catalog
 ```
 
@@ -49,7 +55,7 @@ Each patch produces a subdirectory under `outputs/` named by its patch tag (e.g.
 | `<tag>.log` | Tractor optimization log: iteration-by-iteration `dlnp` values, convergence status, PSF choices. |
 | `<tag>.runner.log` | Full subprocess command line and captured stdout/stderr. Useful for debugging crashes. |
 | `<tag>_cat_fit.csv` | Per-patch fitted catalog. Contains all input columns plus fit result columns. |
-| `meta.json` | Patch metadata including PSF audit (which bands used ePSF vs fallback), optimizer summary (`niters`, `converged`, `hit_max_iters`), and patch geometry. |
+| `meta.json` | Patch metadata including PSF audit (which bands used ePSF vs fallback), patch geometry, and fitting mode. In multi-band mode, also includes optimizer summary (`niters`, `converged`, `hit_max_iters`); in single-band mode, per-band optimizer diagnostics are in the CSV only. |
 | `patch_overview.png` | Three-panel plot: Data (white stack), Model+Sky, Residual. Source positions shown as crosshairs. |
 | `cutouts/src_NNNNNN.png` | Per-source cutout montage (one row per panel: Data, Model+Sky, Residual; one column per band). Crosshairs show original (lime, dashed) and fitted (magenta, solid) positions. |
 
@@ -83,6 +89,10 @@ These columns are added by the pipeline to indicate why a source was excluded fr
 
 ### Fitted Position Columns
 
+The column names depend on the fitting mode (`enable_multi_band_simultaneous_fitting`).
+
+**Multi-band simultaneous fitting** (default, `true`): position is shared across bands.
+
 | Column | Type | Unit | Description |
 |--------|------|------|-------------|
 | `x_pix_patch_fit` | float | pixels | Fitted x position in the local patch coordinate frame. |
@@ -92,9 +102,20 @@ These columns are added by the pipeline to indicate why a source was excluded fr
 | `RA_fit` | float | degrees (ICRS) | Fitted right ascension, computed from `(x_pix_white_fit, y_pix_white_fit)` via WCS. |
 | `DEC_fit` | float | degrees (ICRS) | Fitted declination, computed from `(x_pix_white_fit, y_pix_white_fit)` via WCS. |
 
+**Single-band independent fitting** (`false`): position is fitted independently per band. For each band `{band}`:
+
+| Column | Type | Unit | Description |
+|--------|------|------|-------------|
+| `x_pix_patch_{band}_fit` | float | pixels | Fitted x position in the local patch frame for this band. |
+| `y_pix_patch_{band}_fit` | float | pixels | Fitted y position in the local patch frame for this band. |
+| `x_pix_white_{band}_fit` | float | pixels | Fitted x position in the white-stack frame for this band. |
+| `y_pix_white_{band}_fit` | float | pixels | Fitted y position in the white-stack frame for this band. |
+| `RA_{band}_fit` | float | degrees (ICRS) | Fitted right ascension for this band. |
+| `DEC_{band}_fit` | float | degrees (ICRS) | Fitted declination for this band. |
+
 ### Fitted Flux Columns
 
-For each band `{band}` present in the images (matching `FILTER` header values):
+For each band `{band}` present in the images (matching `FILTER` header values). Column names are the same in both fitting modes:
 
 | Column | Type | Unit | Description |
 |--------|------|------|-------------|
@@ -105,6 +126,8 @@ For each band `{band}` present in the images (matching `FILTER` header values):
     All fitted fluxes are in the scaled system defined by `image_scaling.zp_ref` (default 25.0). To convert to AB magnitudes: `m_AB = -2.5 * log10(FLUX_{band}_fit) + 25.0`.
 
 ### Fitted Morphology Columns
+
+**Multi-band simultaneous fitting** (default, `true`): morphology is shared across bands.
 
 | Column | Type | Unit | Description |
 |--------|------|------|-------------|
@@ -117,10 +140,25 @@ For each band `{band}` present in the images (matching `FILTER` header values):
 | `Re_fit` | float | pixels | Fitted effective radius (same as `re_pix_fit`; provided for naming symmetry with input `Re`). |
 | `THETA_fit` | float | degrees | Fitted position angle, approximately converted back to SExtractor convention: `phi_deg_fit - 90`. Comparable to the input `THETA` column. |
 
+**Single-band independent fitting** (`false`): morphology is fitted independently per band. For each band `{band}`:
+
+| Column | Type | Unit | Description |
+|--------|------|------|-------------|
+| `stype_fit` | string | — | Source type (same across bands, from input `TYPE` column). |
+| `sersic_n_{band}_fit` | float | dimensionless | Fitted Sersic index for this band. |
+| `re_pix_{band}_fit` | float | pixels | Fitted effective radius for this band. |
+| `ab_{band}_fit` | float | dimensionless | Fitted axis ratio for this band. |
+| `phi_deg_{band}_fit` | float | degrees | Fitted position angle for this band. |
+| `ELL_{band}_fit` | float | dimensionless | Fitted ellipticity for this band: `1 - ab_{band}_fit`. |
+| `Re_{band}_fit` | float | pixels | Fitted effective radius for this band. |
+| `THETA_{band}_fit` | float | degrees | Fitted position angle for this band (SExtractor convention). |
+
 !!! note "Morphology columns for point sources"
-    For `stype_fit = "star"`, all morphology columns (`sersic_n_fit`, `re_pix_fit`, `ab_fit`, `phi_deg_fit`, `ELL_fit`, `Re_fit`, `THETA_fit`) are `NaN`.
+    For `stype_fit = "star"`, all morphology columns are `NaN` (in both fitting modes).
 
 ### Optimizer Diagnostic Columns
+
+**Multi-band simultaneous fitting** (default, `true`): one set of optimizer diagnostics per source.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -128,6 +166,15 @@ For each band `{band}` present in the images (matching `FILTER` header values):
 | `opt_hit_max_iters` | bool | `True` if the optimizer did NOT converge and effectively exhausted iteration budget (iterations ≥ `n_opt_iters - flag_maxiter_margin`). |
 | `opt_niters` | int | Number of optimizer iterations actually performed. |
 | `opt_last_dlnp` | float | Last delta-log-probability value from the optimizer. |
+
+**Single-band independent fitting** (`false`): per-band optimizer diagnostics. For each band `{band}`:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `opt_converged_{band}` | bool | Whether the optimizer converged for this band. |
+| `opt_hit_max_iters_{band}` | bool | Whether the optimizer exhausted iterations for this band. |
+| `opt_niters_{band}` | int | Number of iterations for this band. |
+| `opt_last_dlnp_{band}` | float | Last dlnp for this band. |
 
 ### Patch and PSF Audit Columns
 
@@ -155,6 +202,23 @@ These columns are added during patch input building and carried through to the o
 | `x_pix_patch` | float | pixels | Source x position in the local patch frame (= `x_pix_white - x0_roi`). |
 | `y_pix_patch` | float | pixels | Source y position in the local patch frame. |
 
+### Gaia Augmentation Column
+
+When `zp.enabled: true`, the augmented catalog adds this column:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `gaia_source_id` | string | Gaia DR3 `source_id` for sources matched to (or injected from) the GaiaXP synphot catalog. Empty string for non-Gaia sources. |
+
+### Zero-Point Calibrated Magnitude Columns
+
+When `zp.enabled: true`, the ZP computation stage adds these columns for each band `{band}`:
+
+| Column | Type | Unit | Description |
+|--------|------|------|-------------|
+| `MAG_{band}_fit` | float | mag (AB) | AB magnitude: `ZP_median - 2.5 * log10(FLUX_{band}_fit)`. `NaN` for sources with non-positive flux. |
+| `MAGERR_{band}_fit` | float | mag | Magnitude error: `sqrt((2.5/ln10 * FLUXERR/FLUX)^2 + ZP_err^2)`. Propagates both flux error and ZP uncertainty. `NaN` if flux error is missing. |
+
 ---
 
 ## Diagnostic Plots
@@ -173,15 +237,36 @@ These columns are added during patch input building and carried through to the o
 
 - **Orange X** — original (input catalog) positions
 - **Deepskyblue X** — fitted positions
+- **Cyan line** — connecting line from each original position to its fitted position(s)
+
+In single-band mode, each source has **multiple blue markers** (one per band, with reduced alpha/linewidth to avoid clutter), each connected to the single orange marker by a cyan line. In multi-band mode, there is one blue marker per source.
 
 ### Source Cutout Montages
 
-`cutouts/src_NNNNNN.png` shows a grid of panels: one column per band, three rows (Data, Model+Sky, Residual). Crosshairs mark:
+`cutouts/src_NNNNNN.png` shows a grid of panels: one column per band, three rows (Data, Model+Sky, Residual). Markers for the **center source**:
 
-- **Magenta solid** — fitted position
-- **Lime dashed** — original (input) position
-- **Deepskyblue X** — other fitted sources in the cutout
-- **Orange X** — other original source positions in the cutout
+- **Magenta solid crosshair** — fitted position
+- **Lime dashed crosshair** — original (input) position
+
+Markers for **other sources** in the cutout:
+
+- **Deepskyblue X** — fitted position
+- **Orange X** — original position
+- **Cyan line** — connecting line from each original to fitted position
+
+In single-band mode, each band column shows that band's own independently fitted position for the crosshairs and markers.
+
+### ZP Diagnostics
+
+When `zp.enabled: true`, the `ZP/` directory contains:
+
+| File | Description |
+|------|-------------|
+| `input_catalog_*_with_Gaia.csv` | Augmented input catalog with injected Gaia sources and `gaia_source_id` column. |
+| `gaia_augmentation_overlay.png` | White-stack overlay showing original sources (cyan circles), Gaia-matched originals (lime squares), injected Gaia sources (magenta circles), saturation-excluded Gaia sources (red X), and the selection bounding box (yellow dashed). |
+| `zp_vs_mag__{band}.png` | Per-band ZP diagnostic scatter plot: ZP vs GaiaXP synphot AB magnitude. Shows non-converged (gray diamonds), sigma-clipped (red X), kept (black circles with error bars), median line, and MAD band. |
+| `zp_summary.csv` | Per-band summary: `n_raw`, `n_kept`, `n_clipped`, `n_nonconverged`, `clip_sigma`, `zp_median`, `zp_err_mad`. |
+| `zp_all_bands__per_object.csv` | Per-star ZP values for all bands, with `is_kept`/`is_clipped` flags. |
 
 ---
 
@@ -192,9 +277,9 @@ The merge stage:
 1. Reads the original input catalog.
 2. Attaches exclusion flags (crop, saturation) using the merge key.
 3. Collects all `*_cat_fit.csv` files from per-patch output directories.
-4. Concatenates fit results and checks for duplicate merge keys (raises `ValueError` if found).
+4. Concatenates fit results and handles duplicate merge keys (drops duplicates with a warning; rare boundary sources may appear in two patches).
 5. Performs a **left join**: `base_catalog.merge(fit_results, how="left", on=key_cols)`.
-6. Optionally fills `RA_fit`/`DEC_fit` using WCS from `merge.wcs_fits` or the first loaded image.
+6. Optionally computes sky coordinates from fitted pixel positions using WCS from `merge.wcs_fits` or the first loaded image. In multi-band mode: `RA_fit`/`DEC_fit`. In single-band mode: `RA_{band}_fit`/`DEC_{band}_fit` for each band.
 
 ### Merge Key Selection
 

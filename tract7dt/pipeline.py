@@ -571,7 +571,7 @@ def load_inputs(cfg: dict) -> dict:
                 ax.set_ylim(0, H0 - 1)
                 ax.set_xticks([])
                 ax.set_yticks([])
-                plt.savefig(crop_out / "white_before_crop.png", dpi=150)
+                plt.savefig(crop_out / "white_before_crop.png", dpi=int(cfg.get("plotting", {}).get("dpi", 150)))
                 plt.close(fig)
             except Exception as e:
                 _log(f"[WARN] Could not plot pre-crop white: {e}")
@@ -659,7 +659,7 @@ def load_inputs(cfg: dict) -> dict:
             ax.set_title(f"White AFTER crop (DS={ds_post})")
             ax.set_xticks([])
             ax.set_yticks([])
-            plt.savefig(crop_out / "white_after_crop.png", dpi=150)
+            plt.savefig(crop_out / "white_after_crop.png", dpi=int(cfg.get("plotting", {}).get("dpi", 150)))
             plt.close(fig)
         except Exception as e:
             _log(f"[WARN] Could not plot post-crop white: {e}")
@@ -853,7 +853,7 @@ def load_inputs(cfg: dict) -> dict:
         )
         try:
             outpath = outputs["cropped_images_dir"] / "white_overlay.png"
-            fig.savefig(outpath, dpi=150)
+            fig.savefig(outpath, dpi=int(cfg.get("plotting", {}).get("dpi", 150)))
         finally:
             plt.close(fig)
         t_overlay = time.perf_counter() - t0_overlay
@@ -945,6 +945,7 @@ def build_epsf_from_config(cfg: dict, state: dict) -> Path:
         parallel_bands=bool(epsf_cfg.get("parallel_bands", True)),
         max_workers=max_workers_val,
         active_epsf_tags=active_epsf_tags,
+        plot_dpi=int(cfg.get("plotting", {}).get("dpi", 150)),
     )
 
 
@@ -1054,6 +1055,8 @@ def run_patch_subprocesses(cfg: dict) -> Path:
         str(float(moffat_cfg.get("beta", 3.5))),
         "--moffat-radius-pix",
         str(float(moffat_cfg.get("radius_pix", 25.0))),
+        "--plot-dpi",
+        str(int(cfg.get("plotting", {}).get("dpi", 150))),
     ]
     if patch_run_cfg.get("cutout_max_sources") is not None:
         extra_args.extend(["--cutout-max-sources", str(int(patch_run_cfg["cutout_max_sources"]))])
@@ -1061,6 +1064,8 @@ def run_patch_subprocesses(cfg: dict) -> Path:
         extra_args.append("--no-cutouts")
     if bool(patch_run_cfg.get("no_patch_overview", False)):
         extra_args.append("--no-patch-overview")
+    if not bool(patch_run_cfg.get("enable_multi_band_simultaneous_fitting", True)):
+        extra_args.append("--no-enable-multi-band-simultaneous-fitting")
 
     return run_subprocesses(
         patch_input_dir=outputs["patch_inputs_dir"],
@@ -1082,8 +1087,12 @@ def merge_results(cfg: dict, state: dict | None = None) -> Path:
     if wcs_fits is None and state is not None:
         wcs_fits = state.get("wcs_fits")
     exclusion_flags = state.get("exclusion_flags") if state is not None else None
+
+    input_catalog_path = Path(cfg["inputs"]["input_catalog"])
+    if state is not None and "augmented_catalog_path" in state:
+        input_catalog_path = Path(state["augmented_catalog_path"])
     return merge_catalogs(
-        input_catalog=Path(cfg["inputs"]["input_catalog"]),
+        input_catalog=input_catalog_path,
         patch_outdir=outputs["tractor_out_dir"],
         out_path=outputs["final_catalog"],
         pattern=str(merge_cfg["pattern"]),
@@ -1124,10 +1133,20 @@ def run_pipeline(cfg: dict) -> None:
         return result
 
     state = _run_step("load inputs + validation", lambda: load_inputs(cfg))
+
+    if bool(cfg.get("zp", {}).get("enabled", False)):
+        from .zp import augment_catalog_with_gaia
+        _run_step("augment catalog with Gaia sources", lambda: augment_catalog_with_gaia(cfg=cfg, state=state))
+
     _run_step("build ePSF", lambda: build_epsf(cfg, state))
     _run_step("build patches", lambda: build_patches(cfg, state))
     _run_step("build patch inputs", lambda: build_patch_inputs(cfg, state))
     _run_step("run patch subprocesses", lambda: run_patch_subprocesses(cfg))
     final_catalog = _run_step("merge patch catalogs", lambda: merge_results(cfg, state))
     _summarize_fit_results(Path(final_catalog))
+
+    if bool(cfg.get("zp", {}).get("enabled", False)):
+        from .zp import compute_zp
+        _run_step("compute zero-point calibration", lambda: compute_zp(cfg=cfg, merged_catalog_path=Path(final_catalog)))
+
     _log(f"Pipeline finished in {_format_elapsed(time.perf_counter() - t_total)}")

@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -14,6 +16,18 @@ import pandas as pd
 from .logging_utils import setup_logging
 
 logger = logging.getLogger("tract7dt.merge")
+
+
+_GAIA_SID_COL = "gaia_source_id"
+
+
+def _read_csv_safe(path) -> pd.DataFrame:
+    """Read CSV with gaia_source_id forced to string dtype to prevent float64 truncation."""
+    df = pd.read_csv(path)
+    if _GAIA_SID_COL in df.columns:
+        df_retry = pd.read_csv(path, dtype={_GAIA_SID_COL: str})
+        df[_GAIA_SID_COL] = df_retry[_GAIA_SID_COL].fillna("")
+    return df
 
 
 def _pick_key_cols(df: pd.DataFrame) -> list[str]:
@@ -24,6 +38,39 @@ def _pick_key_cols(df: pd.DataFrame) -> list[str]:
     if ra and dec:
         return [ra, dec]
     raise ValueError("Could not find merge key columns. Need 'ID' or ('RA','DEC').")
+
+
+def _fill_ra_dec_from_xy(
+    df: pd.DataFrame,
+    wcs: Any,
+    x_col: str,
+    y_col: str,
+    ra_col: str,
+    dec_col: str,
+) -> None:
+    """Compute RA/DEC from pixel columns using WCS, filling only where missing."""
+    if x_col not in df.columns or y_col not in df.columns:
+        return
+    if ra_col not in df.columns:
+        df[ra_col] = np.nan
+    if dec_col not in df.columns:
+        df[dec_col] = np.nan
+    try:
+        xw = pd.to_numeric(df[x_col], errors="coerce").to_numpy(dtype=float)
+        yw = pd.to_numeric(df[y_col], errors="coerce").to_numpy(dtype=float)
+        ok = np.isfinite(xw) & np.isfinite(yw)
+        ra = df[ra_col].to_numpy(dtype=float, copy=True)
+        dec = df[dec_col].to_numpy(dtype=float, copy=True)
+        fill = ok & (~np.isfinite(ra) | ~np.isfinite(dec))
+        if np.any(fill):
+            r, d = wcs.all_pix2world(xw[fill], yw[fill], 0)
+            ra[fill] = np.asarray(r, dtype=float)
+            dec[fill] = np.asarray(d, dtype=float)
+            df[ra_col] = ra
+            df[dec_col] = dec
+            logger.info("Filled %s/%s from %s/%s using WCS", ra_col, dec_col, x_col, y_col)
+    except Exception as e:
+        logger.warning("failed to compute %s/%s: %s", ra_col, dec_col, str(e))
 
 
 def merge_catalogs(
@@ -40,7 +87,7 @@ def merge_catalogs(
     if not patch_outdir.exists():
         raise SystemExit(f"Missing patch outdir: {patch_outdir}")
 
-    base = pd.read_csv(input_catalog)
+    base = _read_csv_safe(input_catalog)
     key_cols = _pick_key_cols(base)
     if exclusion_flags is not None and len(exclusion_flags) > 0:
         flag_cols = [c for c in ("excluded_crop", "excluded_saturation") if c in exclusion_flags.columns]
@@ -77,7 +124,7 @@ def merge_catalogs(
 
     rows: list[pd.DataFrame] = []
     for p in csvs:
-        df = pd.read_csv(p)
+        df = _read_csv_safe(p)
         legacy_force = ("x_fit_white", "y_fit_white")
         fit_cols = [c for c in df.columns if c not in base.columns or c in legacy_force]
         keep_cols = list(dict.fromkeys(key_cols + fit_cols))
@@ -87,8 +134,13 @@ def merge_catalogs(
     fit = pd.concat(rows, ignore_index=True)
 
     if fit.duplicated(subset=key_cols).any():
-        dup = fit.loc[fit.duplicated(subset=key_cols, keep=False), key_cols].head(10)
-        raise ValueError(f"Duplicate keys in patch results (showing up to 10):\n{dup}")
+        n_dup = int(fit.duplicated(subset=key_cols).sum())
+        dup_sample = fit.loc[fit.duplicated(subset=key_cols, keep=False), key_cols].head(10)
+        logger.warning(
+            "Dropping %d duplicate key(s) in patch results (boundary sources); "
+            "sample:\n%s", n_dup, dup_sample.to_string(),
+        )
+        fit = fit.drop_duplicates(subset=key_cols, keep="first")
 
     merged = base.merge(fit, how="left", on=key_cols, suffixes=("", "_fitdup"))
 
@@ -97,35 +149,26 @@ def merge_catalogs(
         merged = merged.drop(columns=dup_cols)
 
     if wcs_fits:
-        want = ("RA_fit" in merged.columns) and ("DEC_fit" in merged.columns)
-        have_xy = ("x_pix_white_fit" in merged.columns) and ("y_pix_white_fit" in merged.columns)
-        if not want:
-            merged["RA_fit"] = np.nan
-            merged["DEC_fit"] = np.nan
-            want = True
-        if want and have_xy:
-            try:
-                from astropy.io import fits  # type: ignore
-                from astropy.wcs import WCS  # type: ignore
+        try:
+            from astropy.io import fits as afits  # type: ignore
+            from astropy.wcs import WCS  # type: ignore
 
-                with fits.open(str(wcs_fits), memmap=True) as hdul:
-                    wcs = WCS(hdul[0].header)
+            with afits.open(str(wcs_fits), memmap=True) as hdul:
+                wcs = WCS(hdul[0].header)
+        except Exception as e:
+            logger.warning("failed to load WCS from %s: %s", wcs_fits, str(e))
+            wcs = None
 
-                xw = pd.to_numeric(merged["x_pix_white_fit"], errors="coerce").to_numpy(dtype=float)
-                yw = pd.to_numeric(merged["y_pix_white_fit"], errors="coerce").to_numpy(dtype=float)
-                ok = np.isfinite(xw) & np.isfinite(yw)
-                ra = merged["RA_fit"].to_numpy(dtype=float, copy=True)
-                dec = merged["DEC_fit"].to_numpy(dtype=float, copy=True)
-                fill = ok & (~np.isfinite(ra) | ~np.isfinite(dec))
-                if np.any(fill):
-                    r, d = wcs.all_pix2world(xw[fill], yw[fill], 0)
-                    ra[fill] = np.asarray(r, dtype=float)
-                    dec[fill] = np.asarray(d, dtype=float)
-                    merged["RA_fit"] = ra
-                    merged["DEC_fit"] = dec
-                    logger.info("Filled RA_fit/DEC_fit using WCS from: %s", wcs_fits)
-            except Exception as e:
-                logger.warning("failed to compute RA_fit/DEC_fit in merge: %s", str(e))
+        if wcs is not None:
+            _fill_ra_dec_from_xy(merged, wcs, "x_pix_white_fit", "y_pix_white_fit", "RA_fit", "DEC_fit")
+
+            per_band_pat = re.compile(r"^x_pix_white_(.+)_fit$")
+            per_band_x_cols = [c for c in merged.columns if per_band_pat.match(c)]
+            for xc in per_band_x_cols:
+                bn = per_band_pat.match(xc).group(1)
+                yc = f"y_pix_white_{bn}_fit"
+                if yc in merged.columns:
+                    _fill_ra_dec_from_xy(merged, wcs, xc, yc, f"RA_{bn}_fit", f"DEC_{bn}_fit")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     merged.to_csv(out_path, index=False)
