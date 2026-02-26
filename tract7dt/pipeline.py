@@ -230,37 +230,40 @@ def _filter_sources_near_saturation(
     dec_col: str,
     radius_pix: float,
     require_all_bands: bool,
-    return_removed_mask: bool = False,
-) -> pd.DataFrame | tuple[pd.DataFrame, np.ndarray]:
-    if len(input_catalog) == 0:
-        empty_mask = np.zeros(0, dtype=bool)
-        return (input_catalog, empty_mask) if return_removed_mask else input_catalog
+) -> pd.DataFrame:
+    """Flag (not remove) sources near saturated pixels.
+
+    Adds ``excluded_saturation`` boolean column to the catalog.
+    """
+    cat = input_catalog.copy()
+    cat["excluded_saturation"] = False
+
+    if len(cat) == 0:
+        return cat
 
     wcs_white = next(iter(image_dict.values()))["wcs"]
-    ra = pd.to_numeric(input_catalog[ra_col], errors="coerce").to_numpy(dtype=float)
-    dec = pd.to_numeric(input_catalog[dec_col], errors="coerce").to_numpy(dtype=float)
+    ra = pd.to_numeric(cat[ra_col], errors="coerce").to_numpy(dtype=float)
+    dec = pd.to_numeric(cat[dec_col], errors="coerce").to_numpy(dtype=float)
     finite = np.isfinite(ra) & np.isfinite(dec)
     if not np.any(finite):
-        removed = np.zeros(len(input_catalog), dtype=bool)
-        return (input_catalog, removed) if return_removed_mask else input_catalog
+        return cat
 
-    x = np.full(len(input_catalog), np.nan, dtype=float)
-    y = np.full(len(input_catalog), np.nan, dtype=float)
+    x = np.full(len(cat), np.nan, dtype=float)
+    y = np.full(len(cat), np.nan, dtype=float)
     xw, yw = wcs_white.all_world2pix(ra[finite], dec[finite], 0)
     x[finite] = np.asarray(xw, dtype=float)
     y[finite] = np.asarray(yw, dtype=float)
     finite &= np.isfinite(x) & np.isfinite(y)
     if not np.any(finite):
-        removed = np.zeros(len(input_catalog), dtype=bool)
-        return (input_catalog, removed) if return_removed_mask else input_catalog
+        return cat
 
     iy = np.rint(y).astype(int)
     ix = np.rint(x).astype(int)
     offs = _disk_offsets(radius_pix)
 
-    sat_any = np.zeros(len(input_catalog), dtype=bool)
-    sat_all = np.ones(len(input_catalog), dtype=bool)
-    has_band = np.zeros(len(input_catalog), dtype=bool)
+    sat_any = np.zeros(len(cat), dtype=bool)
+    sat_all = np.ones(len(cat), dtype=bool)
+    has_band = np.zeros(len(cat), dtype=bool)
 
     for _band, d in image_dict.items():
         sat = d.get("satur_mask", None)
@@ -268,7 +271,7 @@ def _filter_sources_near_saturation(
             continue
         sat = np.asarray(sat, dtype=bool)
         H, W = sat.shape
-        band_hit = np.zeros(len(input_catalog), dtype=bool)
+        band_hit = np.zeros(len(cat), dtype=bool)
         for dy, dx in offs:
             yy = iy + int(dy)
             xx = ix + int(dx)
@@ -286,13 +289,10 @@ def _filter_sources_near_saturation(
         sat_hit = sat_any
         mode = "any-band"
 
-    keep = ~sat_hit
-    n_before = len(input_catalog)
-    out = input_catalog.loc[keep].copy().reset_index(drop=True)
-    n_removed = n_before - len(out)
-    _log(f"Saturation-cut ({mode}): removed {n_removed}/{n_before} sources within radius_pix={float(radius_pix):.2f}")
-    removed = ~keep
-    return (out, removed) if return_removed_mask else out
+    cat["excluded_saturation"] = sat_hit
+    n_flagged = int(sat_hit.sum())
+    _log(f"Saturation-cut ({mode}): flagged {n_flagged}/{len(cat)} sources within radius_pix={float(radius_pix):.2f}")
+    return cat
 
 
 def _active_epsf_tags_from_catalog(
@@ -304,7 +304,13 @@ def _active_epsf_tags_from_catalog(
     if len(input_catalog) == 0:
         return set()
 
-    col_map = {str(c).strip().lower(): str(c) for c in input_catalog.columns}
+    cat = input_catalog
+    if "excluded_any" in cat.columns:
+        cat = cat[~cat["excluded_any"].fillna(False).astype(bool)]
+    if len(cat) == 0:
+        return set()
+
+    col_map = {str(c).strip().lower(): str(c) for c in cat.columns}
     ra_col = col_map.get("ra")
     dec_col = col_map.get("dec")
     if ra_col is None or dec_col is None:
@@ -314,14 +320,14 @@ def _active_epsf_tags_from_catalog(
     sample_img = next(iter(image_dict.values()))["img_scaled"]
     ny, nx = sample_img.shape
 
-    ra = pd.to_numeric(input_catalog[ra_col], errors="coerce").to_numpy(dtype=float)
-    dec = pd.to_numeric(input_catalog[dec_col], errors="coerce").to_numpy(dtype=float)
+    ra = pd.to_numeric(cat[ra_col], errors="coerce").to_numpy(dtype=float)
+    dec = pd.to_numeric(cat[dec_col], errors="coerce").to_numpy(dtype=float)
     finite = np.isfinite(ra) & np.isfinite(dec)
     if not np.any(finite):
         return set()
 
-    x = np.full(len(input_catalog), np.nan, dtype=float)
-    y = np.full(len(input_catalog), np.nan, dtype=float)
+    x = np.full(len(cat), np.nan, dtype=float)
+    y = np.full(len(cat), np.nan, dtype=float)
     xw, yw = wcs.all_world2pix(ra[finite], dec[finite], 0)
     x[finite] = np.asarray(xw, dtype=float)
     y[finite] = np.asarray(yw, dtype=float)
@@ -387,10 +393,12 @@ def load_inputs(cfg: dict) -> dict:
     if ra_col != "RA" or dec_col != "DEC":
         _log(f"[WARN] input_catalog uses {ra_col}/{dec_col} columns; interpreting as Right Ascension / Declination. Expected format is RA/DEC.")
     id_col = col_map.get("id")
-    key_cols = [id_col] if id_col is not None else [ra_col, dec_col]
-    exclusion_flags = input_catalog[key_cols].copy()
-    exclusion_flags["excluded_crop"] = False
-    exclusion_flags["excluded_saturation"] = False
+    if id_col is not None:
+        # Re-read ID as string so numeric-looking IDs (e.g. 00001) are preserved.
+        id_retry = pd.read_csv(inputs["input_catalog"], dtype={id_col: str})[id_col]
+        input_catalog[id_col] = id_retry.fillna("").astype("string")
+    input_catalog["excluded_crop"] = False
+    input_catalog["excluded_saturation"] = False
 
     image_list = _read_image_list(inputs["image_list_file"], cfg["config_dir"])
     _log(f"7DT frames to stack: {len(image_list)} (list={inputs['image_list_file']})")
@@ -523,9 +531,6 @@ def load_inputs(cfg: dict) -> dict:
 
     _log(f"White made: {white.shape}")
 
-    n_crop_excluded = 0
-    sat_removed_catalog = None
-
     if crop_cfg.get("enabled", True):
         t0_crop = time.perf_counter()
         CROP_MARGIN = int(crop_cfg.get("margin", 500))
@@ -577,7 +582,7 @@ def load_inputs(cfg: dict) -> dict:
                 _log(f"[WARN] Could not plot pre-crop white: {e}")
 
         wcs0 = next(iter(image_dict.values()))["wcs"]
-        _log("Applying crop to catalog and per-band arrays/WCS...")
+        _log("Applying crop to per-band arrays/WCS and flagging out-of-crop sources...")
         ra = pd.to_numeric(input_catalog[ra_col], errors="coerce").to_numpy(dtype=float)
         dec = pd.to_numeric(input_catalog[dec_col], errors="coerce").to_numpy(dtype=float)
         ok = np.isfinite(ra) & np.isfinite(dec)
@@ -591,18 +596,9 @@ def load_inputs(cfg: dict) -> dict:
         keep = np.zeros(len(input_catalog), dtype=bool)
         keep[np.where(ok)[0][in_crop]] = True
 
-        n0 = len(input_catalog)
-        removed_crop_keys = input_catalog.loc[~keep, key_cols].copy()
-        if len(removed_crop_keys) > 0:
-            tmp = removed_crop_keys.copy()
-            tmp["__excluded_crop"] = True
-            tmp = tmp.drop_duplicates(subset=key_cols)
-            exclusion_flags = exclusion_flags.merge(tmp, on=key_cols, how="left")
-            exclusion_flags["excluded_crop"] = exclusion_flags["excluded_crop"] | exclusion_flags["__excluded_crop"].fillna(False)
-            exclusion_flags = exclusion_flags.drop(columns=["__excluded_crop"])
-        input_catalog = input_catalog.loc[keep].copy().reset_index(drop=True)
-        n_crop_excluded = n0 - len(input_catalog)
-        _log(f"input_catalog: {n0} -> {len(input_catalog)} rows after crop filtering")
+        input_catalog["excluded_crop"] = ~keep
+        n_crop_excluded = int((~keep).sum())
+        _log(f"input_catalog: flagged {n_crop_excluded}/{len(input_catalog)} sources as excluded_crop")
 
         white = np.asarray(white)[y0:y1, x0:x1]
         sigma_white = np.asarray(sigma_white)[y0:y1, x0:x1]
@@ -667,30 +663,23 @@ def load_inputs(cfg: dict) -> dict:
 
     if bool(sat_cut_cfg.get("enabled", False)):
         t0_sat = time.perf_counter()
-        _log("Applying saturation-cut filtering on input catalog...")
-        filtered_catalog, sat_removed_mask = _filter_sources_near_saturation(
+        _log("Applying saturation-cut flagging on input catalog...")
+        input_catalog = _filter_sources_near_saturation(
             input_catalog=input_catalog,
             image_dict=image_dict,
             ra_col=ra_col,
             dec_col=dec_col,
             radius_pix=float(sat_cut_cfg.get("radius_pix", 2.0)),
             require_all_bands=bool(sat_cut_cfg.get("require_all_bands", False)),
-            return_removed_mask=True,
         )
-        if len(filtered_catalog) != len(input_catalog):
-            removed_sat_keys = input_catalog.loc[sat_removed_mask, key_cols].copy()
-            if len(removed_sat_keys) > 0:
-                tmp = removed_sat_keys.copy()
-                tmp["__excluded_saturation"] = True
-                tmp = tmp.drop_duplicates(subset=key_cols)
-                exclusion_flags = exclusion_flags.merge(tmp, on=key_cols, how="left")
-                exclusion_flags["excluded_saturation"] = (
-                    exclusion_flags["excluded_saturation"] | exclusion_flags["__excluded_saturation"].fillna(False)
-                )
-                exclusion_flags = exclusion_flags.drop(columns=["__excluded_saturation"])
-        sat_removed_catalog = input_catalog.loc[sat_removed_mask].copy()
-        input_catalog = filtered_catalog
         t_sat = time.perf_counter() - t0_sat
+
+    input_catalog["excluded_any"] = (
+        input_catalog["excluded_crop"].fillna(False).astype(bool)
+        | input_catalog["excluded_saturation"].fillna(False).astype(bool)
+    )
+    n_active = int((~input_catalog["excluded_any"]).sum())
+    _log(f"Active (non-excluded) sources: {n_active}/{len(input_catalog)}")
 
     if crop_cfg.get("overlay_catalog", True):
         t0_overlay = time.perf_counter()
@@ -699,14 +688,20 @@ def load_inputs(cfg: dict) -> dict:
         H, W = white.shape
         fallback_model = str(cfg.get("patch_run", {}).get("gal_model", "dev")).upper()
 
-        ra = pd.to_numeric(input_catalog[ra_col], errors="coerce").to_numpy(dtype=float)
-        dec = pd.to_numeric(input_catalog[dec_col], errors="coerce").to_numpy(dtype=float)
+        _is_active = ~input_catalog["excluded_any"].to_numpy(dtype=bool)
+        _is_sat = input_catalog["excluded_saturation"].fillna(False).to_numpy(dtype=bool) & ~input_catalog["excluded_crop"].fillna(False).to_numpy(dtype=bool)
+        n_crop_excluded = int(input_catalog["excluded_crop"].fillna(False).astype(bool).sum())
+        n_sat_excluded = int(_is_sat.sum())
+
+        active_cat = input_catalog.loc[_is_active].copy()
+        ra = pd.to_numeric(active_cat[ra_col], errors="coerce").to_numpy(dtype=float)
+        dec = pd.to_numeric(active_cat[dec_col], errors="coerce").to_numpy(dtype=float)
         if type_col is not None:
-            type_series = input_catalog[type_col].astype(str).str.strip().str.upper()
+            type_series = active_cat[type_col].astype(str).str.strip().str.upper()
             type_series = type_series.replace({"": "UNKNOWN", "NAN": "UNKNOWN", "NONE": "UNKNOWN", "NULL": "UNKNOWN"})
             type_str = type_series.to_numpy()
         else:
-            type_str = np.full(len(input_catalog), "UNKNOWN", dtype=object)
+            type_str = np.full(len(active_cat), "UNKNOWN", dtype=object)
 
         ok = np.isfinite(ra) & np.isfinite(dec)
 
@@ -724,16 +719,14 @@ def load_inputs(cfg: dict) -> dict:
         is_gal = np.isin(type_ok, ["GAL", "EXP", "DEV", "SERSIC"])
         is_unknown = ~(is_star | is_gal)
 
-        # Sources with NaN coords or projecting outside image bounds (from surviving catalog)
-        n_nan_or_oob = int(len(input_catalog)) - int(inb.sum())
+        n_nan_or_oob = int(len(active_cat)) - int(ok.sum()) + int(ok.sum()) - int(inb.sum())
 
-        # -- Saturation-excluded sources (plot with distinct marker) --
         x_sat = np.array([], dtype=float)
         y_sat = np.array([], dtype=float)
-        n_sat_excluded = 0
-        if sat_removed_catalog is not None and len(sat_removed_catalog) > 0:
-            _sat_ra = pd.to_numeric(sat_removed_catalog[ra_col], errors="coerce").to_numpy(dtype=float)
-            _sat_dec = pd.to_numeric(sat_removed_catalog[dec_col], errors="coerce").to_numpy(dtype=float)
+        sat_cat = input_catalog.loc[_is_sat]
+        if len(sat_cat) > 0:
+            _sat_ra = pd.to_numeric(sat_cat[ra_col], errors="coerce").to_numpy(dtype=float)
+            _sat_dec = pd.to_numeric(sat_cat[dec_col], errors="coerce").to_numpy(dtype=float)
             _sat_ok = np.isfinite(_sat_ra) & np.isfinite(_sat_dec)
             if np.any(_sat_ok):
                 _sx, _sy = wcs_white.all_world2pix(_sat_ra[_sat_ok], _sat_dec[_sat_ok], 0)
@@ -742,7 +735,6 @@ def load_inputs(cfg: dict) -> dict:
                 _sinb = (_sx >= 0) & (_sx < W) & (_sy >= 0) & (_sy < H)
                 x_sat = _sx[_sinb]
                 y_sat = _sy[_sinb]
-            n_sat_excluded = int(len(sat_removed_catalog))
 
         DS_FULL = int(crop_cfg.get("overlay_downsample_full", 1))
 
@@ -810,7 +802,6 @@ def load_inputs(cfg: dict) -> dict:
                     transform=ax.get_transform("pixel"),
                 )
 
-            # Saturation-excluded sources (plotted with distinct marker)
             if len(x_sat) > 0:
                 ax.scatter(
                     x_sat,
@@ -824,15 +815,12 @@ def load_inputs(cfg: dict) -> dict:
                     transform=ax.get_transform("pixel"),
                 )
             elif n_sat_excluded > 0:
-                # All fell outside bounds; add legend-only entry
                 ax.plot([], [], "rx", markersize=6, label=f"Sat-excl (N={n_sat_excluded})")
 
-            # Crop-excluded sources (legend only; positions outside cropped image)
             if n_crop_excluded > 0:
                 ax.plot([], [], "o", mfc="none", mec="gray", markersize=5,
                         label=f"Crop-excl (N={n_crop_excluded})")
 
-            # Sources with NaN coords or out-of-bounds projection (legend only)
             if n_nan_or_oob > 0:
                 ax.plot([], [], "d", mfc="none", mec="gray", markersize=4,
                         label=f"NaN/OOB (N={n_nan_or_oob})")
@@ -868,7 +856,6 @@ def load_inputs(cfg: dict) -> dict:
         white=white,
         sigma_white=sigma_white,
         wcs_fits=wcs_fits,
-        exclusion_flags=exclusion_flags,
     )
     t_total = time.perf_counter() - t_load0
     _log(
@@ -909,6 +896,22 @@ def build_epsf_from_config(cfg: dict, state: dict) -> Path:
         recenter_boxsize=int(epsf_cfg["recenter_boxsize"]),
         final_psf_size=int(epsf_cfg["final_psf_size"]),
         save_star_montage_max=int(epsf_cfg["save_star_montage_max"]),
+        background_subtract_patch=bool(epsf_cfg.get("background_subtract_patch", True)),
+        background_boxsize=int(epsf_cfg.get("background_boxsize", 48)),
+        background_filtersize=int(epsf_cfg.get("background_filtersize", 5)),
+        background_source_mask_sigma=float(epsf_cfg.get("background_source_mask_sigma", 3.0)),
+        background_mask_dilate=int(epsf_cfg.get("background_mask_dilate", 1)),
+        star_local_bkg_subtract=bool(epsf_cfg.get("star_local_bkg_subtract", True)),
+        star_local_bkg_annulus_rin_pix=float(epsf_cfg.get("star_local_bkg_annulus_rin_pix", 20.0)),
+        star_local_bkg_annulus_rout_pix=float(epsf_cfg.get("star_local_bkg_annulus_rout_pix", 30.0)),
+        star_local_bkg_sigma=float(epsf_cfg.get("star_local_bkg_sigma", 3.0)),
+        star_local_bkg_minpix=int(epsf_cfg.get("star_local_bkg_minpix", 30)),
+        save_patch_background_diagnostics=bool(epsf_cfg.get("save_patch_background_diagnostics", True)),
+        save_star_local_background_diagnostics=bool(epsf_cfg.get("save_star_local_background_diagnostics", True)),
+        diagnostics_show_colorbar=bool(epsf_cfg.get("diagnostics_show_colorbar", True)),
+        save_growth_curve=bool(epsf_cfg.get("save_growth_curve", True)),
+        save_residual_diagnostics=bool(epsf_cfg.get("save_residual_diagnostics", True)),
+        residual_diag_max_stars=int(epsf_cfg.get("residual_diag_max_stars", 100)),
     )
 
     gaiaxp = None
@@ -985,11 +988,18 @@ def build_patch_inputs_from_config(cfg: dict, state: dict) -> list[dict]:
 
     patch_def_path = outputs["patches_dir"] / "patches.json"
 
+    cat = state["input_catalog"]
+    if "excluded_any" in cat.columns:
+        active = cat[~cat["excluded_any"].fillna(False).astype(bool)].copy().reset_index(drop=True)
+        _log(f"Patch inputs: using {len(active)}/{len(cat)} non-excluded sources")
+    else:
+        active = cat
+
     return _build_patch_inputs_impl(
         patch_def_path=patch_def_path,
         out_dir=outputs["patch_inputs_dir"],
         image_dict=state["image_dict"],
-        input_catalog=state["input_catalog"],
+        input_catalog=active,
         include_wcs_in_payload=bool(patch_inputs_cfg["include_wcs_in_payload"]),
         save_patch_inputs=bool(patch_inputs_cfg["save_patch_inputs"]),
         skip_empty_patch=bool(patch_inputs_cfg["skip_empty_patch"]),
@@ -1086,7 +1096,6 @@ def merge_results(cfg: dict, state: dict | None = None) -> Path:
     wcs_fits = merge_cfg.get("wcs_fits")
     if wcs_fits is None and state is not None:
         wcs_fits = state.get("wcs_fits")
-    exclusion_flags = state.get("exclusion_flags") if state is not None else None
 
     input_catalog_path = Path(cfg["inputs"]["input_catalog"])
     if state is not None and "augmented_catalog_path" in state:
@@ -1097,7 +1106,6 @@ def merge_results(cfg: dict, state: dict | None = None) -> Path:
         out_path=outputs["final_catalog"],
         pattern=str(merge_cfg["pattern"]),
         wcs_fits=Path(wcs_fits) if wcs_fits else None,
-        exclusion_flags=exclusion_flags,
     )
 
 

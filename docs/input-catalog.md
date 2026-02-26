@@ -42,7 +42,7 @@ These columns are not strictly required but significantly improve model initiali
 
 | Column | Type   | Unit / Convention | Description |
 |--------|--------|-------------------|-------------|
-| `ID`   | any (str or int) | — | Unique source identifier. **Strongly recommended.** Used as the merge key when joining patch fit results back to the input catalog. If absent, the pipeline falls back to using `RA`+`DEC` as a composite merge key, which is fragile for sources at identical coordinates. |
+| `ID`   | string | — | Unique source identifier. **Strongly recommended.** Used as the merge key when joining patch fit results back to the input catalog. If absent, the pipeline falls back to using `RA`+`DEC` as a composite merge key, which is fragile for sources at identical coordinates. IDs are treated as **format-free strings** — the pipeline reads and preserves them exactly as written in the CSV. Leading zeros, non-numeric characters, and arbitrary text are all preserved (e.g. `00019`, `1858283`, `my_star_alpha`). The ID is also used in cutout filenames (`src_{ID}.png`). |
 | `TYPE` | string | One of: `STAR`, `GAL`, `EXP`, `DEV`, `SERSIC` | Morphological classification that determines the Tractor source model. See [Source Model Mapping](#14-source-model-mapping) below. |
 
 ### 1.3 Optional Columns
@@ -135,7 +135,7 @@ ID,RA,DEC,TYPE,FLUX_m400,FLUX_m475,FLUX_m550,FLUX_m625,ELL,THETA,Re
 | `ValueError: input_catalog must have RA/DEC columns` | No column named `RA` or `DEC` (case-insensitive). | Rename your coordinate columns to `RA` and `DEC`. |
 | `RuntimeError: Band mismatch between input catalog and image list` | `FLUX_*` column band names don't match image `FILTER` headers. | Ensure `FLUX_` suffixes exactly match FITS `FILTER` values, or remove all `FLUX_*` columns to use aperture-photometry initialization. |
 | Warning: `input_catalog uses ra/dec columns; interpreting as Right Ascension / Declination` | Columns are lowercase `ra`/`dec` instead of `RA`/`DEC`. | Rename to uppercase. The pipeline works but warns. |
-| Many sources with empty fit columns in output | Sources have `NaN` coordinates, project outside image bounds, or were excluded by crop/saturation filters. | Check `excluded_*` columns in the output. Verify coordinate frame matches WCS. |
+| Many sources with empty fit columns in output | Sources have `NaN` coordinates, project outside image bounds, or were flagged by crop/saturation filters. | Check `excluded_*` columns in the output. Verify coordinate frame matches WCS. |
 | All sources labeled `UNKNOWN` in overlay plots | `TYPE` column is missing or contains unrecognized values. | Add a `TYPE` column, or accept the fallback model set by `patch_run.gal_model`. |
 | `ValueError: Duplicate keys in patch results` | Multiple sources share the same `ID` (or same `RA`+`DEC` when `ID` is absent). | Ensure `ID` values are unique, or ensure no two sources share identical coordinates. |
 
@@ -213,7 +213,7 @@ scaled_image = raw_image * scale_factor
 
 Where `zp_ref` is set by `image_scaling.zp_ref` (default: 25.0). This means that in the scaled system:
 
-- A source with flux `F` (in scaled counts) has magnitude: `mag = -2.5 * log10(F) + zp_ref`
+- A source with flux `F` (in scaled counts) has **approximate** magnitude: `mag ≈ -2.5 * log10(F) + zp_ref`. This is exact only if `ZP_AUTO` in the FITS header perfectly represents the true zero-point. In practice, `ZP_AUTO` has errors, so the pipeline's ZP calibration stage (when `zp.enabled`) derives the actual ZP from Gaia-matched stars and applies calibrated `MAG_{band}_fit` columns.
 - All `FLUX_*` values in the input catalog (if provided) should be in this same scaled system.
 - All fitted flux values in the output catalog are in this system.
 

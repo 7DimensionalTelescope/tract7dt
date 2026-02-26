@@ -42,11 +42,27 @@ This page focuses on speed controls that do not intentionally reduce scientific 
 
 If diagnostics are costly:
 
+**Downsampling** (reduces plot resolution, not science):
+
 - `crop.display_downsample` (pre-crop white)
 - `crop.post_crop_display_downsample` (post-crop white)
 - `crop.overlay_downsample_full` (overlay plot)
 
-These affect diagnostic rendering workload, not fit model internals.
+**ePSF diagnostic toggles** (disable to skip plot generation entirely):
+
+- `epsf.save_star_local_background_diagnostics: false` — **highest impact**. Generates a multi-row plot for every used star in every ePSF cell. Disabling this provides major speed and I/O savings in dense fields.
+- `epsf.save_patch_background_diagnostics: false` — skips per-cell background diagnostic panels.
+- `epsf.save_growth_curve: false` — skips ePSF growth curve plots.
+- `epsf.save_residual_diagnostics: false` — skips ePSF residual diagnostic plots.
+- `epsf.diagnostics_show_colorbar: false` — removes colorbars from background diagnostics (minor savings).
+
+**Patch fitting diagnostic toggles:**
+
+- `patch_run.no_cutouts: true` — skips per-source cutout montages. Significant savings when many sources are fit.
+- `patch_run.no_patch_overview: true` — skips per-patch overview plots.
+- `patch_run.cutout_max_sources: N` — limits cutout montages to the first N sources per patch.
+
+All diagnostic toggles affect rendering/I/O only, not fit model internals.
 
 ## Concurrency Caveats
 

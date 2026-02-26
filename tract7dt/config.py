@@ -8,13 +8,13 @@ import yaml
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "inputs": {
-        "tile_name": "UDS",
-        "input_catalog": "/data2/seoldh/Tractor_Pipeline/input_catalog_from_subaru.csv",
-        "image_list_file": "image_list.txt",
-        "gaiaxp_synphot_csv": "/data2/seoldh/Tractor_Pipeline/7DT/gaiaxp_dr3_synphot_UDS.csv",
+        "tile_name": "your_tile_name",
+        "input_catalog": "path/to/input_catalog.csv",
+        "image_list_file": "path/to/image_list.txt",
+        "gaiaxp_synphot_csv": "path/to/gaiaxp_synphot.csv",
     },
     "outputs": {
-        "work_dir": "/data2/seoldh/test_tract7dt",
+        "work_dir": "path/to/work_dir",
         "epsf_dir": "EPSFs",
         "patches_dir": "patches",
         "patch_inputs_dir": "patch_payloads",
@@ -55,7 +55,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "logging": {
         "ignore_warnings": True,
         "level": "INFO",
-        "file": None,
+        "file": "auto",
         "format": "%(asctime)s | %(name)s | %(levelname)s | %(message)s",
     },
     "plotting": {
@@ -76,7 +76,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "edge_pad": 10,
         "min_sep": 30.0,
         "max_stars": 30,
-        "q_range": [0.95, 1.05],
+        "q_range": [0.7, 1.3],
         "psfstar_mode": "sep+gaia",
         "gaia_mag_min": 10.0,
         "gaia_mag_max": 30.0,
@@ -94,6 +94,22 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "recenter_boxsize": 9,
         "final_psf_size": 55,
         "save_star_montage_max": 100,
+        "background_subtract_patch": True,
+        "background_boxsize": 96,
+        "background_filtersize": 9,
+        "background_source_mask_sigma": 3.0,
+        "background_mask_dilate": 1,
+        "star_local_bkg_subtract": True,
+        "star_local_bkg_annulus_rin_pix": 20.0,
+        "star_local_bkg_annulus_rout_pix": 30.0,
+        "star_local_bkg_sigma": 3.0,
+        "star_local_bkg_minpix": 30,
+        "save_patch_background_diagnostics": True,
+        "save_star_local_background_diagnostics": True,
+        "diagnostics_show_colorbar": True,
+        "save_growth_curve": True,
+        "save_residual_diagnostics": True,
+        "residual_diag_max_stars": 100,
         "parallel_bands": True,
         "max_workers": "auto",
     },
@@ -115,7 +131,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_workers": 32,
         "threads_per_process": 1,
         "gal_model": "exp",
-        "n_opt_iters": 25,
+        "n_opt_iters": 20,
         "dlnp_stop": 1e-6,
         "r_ap": 5.0,
         "eps_flux": 1e-4,
@@ -123,7 +139,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "re_fallback_pix": 3.0,
         "psf_model": "pixelized",
         "psf_fallback_model": "moffat",
-        "min_epsf_nstars_for_use": 5,
+        "min_epsf_nstars_for_use": 2,
         "ncircular_gaussian_n": 3,
         "hybrid_psf_n": 9,
         "gaussian_mixture_n": 4,
@@ -152,11 +168,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "wcs_fits": None,
     },
     "zp": {
-        "enabled": False,
+        "enabled": True,
+        "inject_gaia_sources": True,
         "gaia_mag_min": 8.0,
         "gaia_mag_max": 18.0,
         "match_radius_arcsec": 3.0,
-        "min_box_size_pix": 1000,
+        "min_box_size_pix": 3000,
         "clip_sigma": 3.0,
         "clip_max_iters": 10,
     },
@@ -291,8 +308,9 @@ def load_config(config_path: str | Path) -> dict[str, Any]:
         moffat_cfg["module_path"] = _resolve_path(moffat_cfg["module_path"], cfg_dir)
 
     logging_cfg = cfg["logging"]
-    if logging_cfg.get("file"):
-        logging_cfg["file"] = _resolve_path(logging_cfg["file"], cfg_dir)
+    log_file = logging_cfg.get("file")
+    if log_file is not None and str(log_file).strip().lower() != "auto":
+        logging_cfg["file"] = _resolve_path(log_file, work_dir)
 
     return cfg
 

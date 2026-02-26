@@ -112,7 +112,7 @@ load_inputs timing [s]: prep=X.XX white=X.XX crop=X.XX sat=X.XX overlay=X.XX tot
 **Check:**
 
 - `epsf.skip_empty_epsf_patches: true` may be intentionally pruning empty cells. This is expected in sparse fields.
-- Source density after crop and saturation filters may be very low.
+- Source density after crop and saturation flagging may be very low.
 - ePSF selection thresholds may be too aggressive:
   - `epsf.thresh_sigma` (detection threshold) — lowering it finds fainter candidates.
   - `epsf.minarea` (minimum detection area) — lowering it accepts smaller detections.
@@ -197,21 +197,34 @@ Check `<tag>.runner.log` for the full subprocess output. Common causes:
 
 ### Rows with no fit values in the output
 
-This can be normal. Sources that were excluded or not assigned to any patch will have empty fit columns. Inspect:
+This can be normal. Sources that were **flagged** as excluded are preserved in the final catalog but not assigned to any patch, so their fit columns are empty. Inspect:
 
 - `excluded_crop` — was the source outside the crop region?
 - `excluded_saturation` — was the source near saturated pixels?
 - `excluded_any` — was the source excluded for any reason?
-- `excluded_reason` — human-readable reason.
+- `excluded_reason` — human-readable reason: `"crop"`, `"saturation"`, `"crop+saturation"`, or `""`.
 
 If `excluded_any` is false but fit columns are still empty, the source may have had `NaN` coordinates or projected outside image bounds.
+
+### ID column read as numeric (leading zeros lost)
+
+**Cause:** When per-patch fit CSVs are read, pandas may infer an all-numeric `ID` column as `int64`, stripping leading zeros (e.g. `00101` → `101`). This causes a merge key mismatch.
+
+**Status:** This is handled automatically. The pipeline reads `ID` as string dtype in all CSV reads (both base and patch-fit catalogs), preserving the original format. IDs are format-free strings — `00019`, `1858283`, and `star_alpha` all work correctly.
 
 ### `download-sample` logging differs from pipeline logging
 
 This is expected:
 
-- Pipeline commands (`run`, `run-epsf`, etc.) apply the YAML `logging.*` configuration.
+- Pipeline commands (`run`, `run-epsf`, etc.) apply the YAML `logging.*` configuration. By default, logs are written to `{work_dir}/{command}.log` (e.g. `run.log`, `merge.log`).
 - `download-sample` runs without `--config`, so it uses its own independent logging setup.
+
+### Log file location
+
+With the default `logging.file: "auto"`, each command writes its log to `{work_dir}/{command}.log`. To change this:
+
+- Set `logging.file: "my_custom.log"` — resolved relative to `work_dir`.
+- Set `logging.file: null` — disable file logging entirely (console only).
 
 ---
 

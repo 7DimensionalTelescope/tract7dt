@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import logging
+import shutil
 from pathlib import Path
 
 from .config import load_config, write_sample_config
@@ -22,11 +24,27 @@ def _add_common(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--config", required=True, help="Path to YAML config")
 
 
+def _load_and_augment(cfg: dict) -> dict:
+    """Load inputs and conditionally augment with Gaia sources.
+
+    Mirrors the first two stages of ``run_pipeline`` so that step commands
+    produce the same catalog state as a full run.
+    """
+    state = load_inputs(cfg)
+    if bool(cfg.get("zp", {}).get("enabled", False)):
+        from .zp import augment_catalog_with_gaia
+        augment_catalog_with_gaia(cfg=cfg, state=state)
+    return state
+
+
 def main(argv: list[str] | None = None) -> int:
     setup_logging()
     log = logging.getLogger("tract7dt.cli")
 
+    from . import __version__
+
     ap = argparse.ArgumentParser(prog="tract7dt")
+    ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     ap_bump = sub.add_parser("dump-config", help="Write the latest sample config file")
@@ -91,24 +109,39 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     cfg = load_config(args.config)
-    setup_logging(cfg.get("logging", {}), force=True)
+
+    log_cfg = cfg.get("logging", {})
+    log_file = log_cfg.get("file")
+    if isinstance(log_file, str) and log_file.strip().lower() == "auto":
+        log_cfg["file"] = Path(cfg["outputs"]["work_dir"]) / f"{args.cmd}.log"
+    setup_logging(log_cfg, force=True)
+
+    work_dir = Path(cfg["outputs"]["work_dir"])
+    work_dir.mkdir(parents=True, exist_ok=True)
+    cfg_src = cfg.get("config_path")
+    if cfg_src and Path(cfg_src).exists():
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        snap = work_dir / f"config_used_{ts}.yaml"
+        shutil.copy2(str(cfg_src), str(snap))
+        log.info("Config snapshot saved: %s", snap)
 
     if args.cmd == "run":
         run_pipeline(cfg)
     elif args.cmd == "run-epsf":
-        state = load_inputs(cfg)
+        state = _load_and_augment(cfg)
         build_epsf(cfg, state)
     elif args.cmd == "build-patches":
-        state = load_inputs(cfg)
+        state = _load_and_augment(cfg)
         build_patches(cfg, state)
     elif args.cmd == "build-patch-inputs":
-        state = load_inputs(cfg)
+        state = _load_and_augment(cfg)
         build_patches(cfg, state)
         build_patch_inputs(cfg, state)
     elif args.cmd == "run-patches":
         run_patch_subprocesses(cfg)
     elif args.cmd == "merge":
-        merge_results(cfg)
+        state = _load_and_augment(cfg)
+        merge_results(cfg, state)
     elif args.cmd == "compute-zp":
         from .zp import compute_zp
         merged_path = Path(cfg["outputs"]["final_catalog"])

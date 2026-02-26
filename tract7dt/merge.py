@@ -22,11 +22,23 @@ _GAIA_SID_COL = "gaia_source_id"
 
 
 def _read_csv_safe(path) -> pd.DataFrame:
-    """Read CSV with gaia_source_id forced to string dtype to prevent float64 truncation."""
-    df = pd.read_csv(path)
-    if _GAIA_SID_COL in df.columns:
-        df_retry = pd.read_csv(path, dtype={_GAIA_SID_COL: str})
-        df[_GAIA_SID_COL] = df_retry[_GAIA_SID_COL].fillna("")
+    """Read CSV with ID and gaia_source_id forced to string dtype.
+
+    Prevents int64 inference that strips leading zeros from numeric-looking
+    IDs (e.g. '00101' -> 101) and float64 truncation of Gaia source IDs.
+    """
+    str_cols: dict[str, type] = {}
+    header = pd.read_csv(path, nrows=0)
+    if "ID" in header.columns:
+        str_cols["ID"] = str
+    if _GAIA_SID_COL in header.columns:
+        str_cols[_GAIA_SID_COL] = str
+    if str_cols:
+        df = pd.read_csv(path, dtype=str_cols)
+        for col in str_cols:
+            df[col] = df[col].fillna("")
+    else:
+        df = pd.read_csv(path)
     return df
 
 
@@ -38,6 +50,12 @@ def _pick_key_cols(df: pd.DataFrame) -> list[str]:
     if ra and dec:
         return [ra, dec]
     raise ValueError("Could not find merge key columns. Need 'ID' or ('RA','DEC').")
+
+
+def _normalize_id_key(df: pd.DataFrame, key_cols: list[str]) -> None:
+    """Normalize ID merge key to pandas string dtype in-place."""
+    if key_cols == ["ID"] and "ID" in df.columns:
+        df["ID"] = df["ID"].astype("string").fillna("")
 
 
 def _fill_ra_dec_from_xy(
@@ -89,10 +107,30 @@ def merge_catalogs(
 
     base = _read_csv_safe(input_catalog)
     key_cols = _pick_key_cols(base)
-    if exclusion_flags is not None and len(exclusion_flags) > 0:
+    _normalize_id_key(base, key_cols)
+
+    has_inline_flags = "excluded_crop" in base.columns or "excluded_saturation" in base.columns
+
+    if has_inline_flags:
+        for c in ("excluded_crop", "excluded_saturation"):
+            if c not in base.columns:
+                base[c] = False
+            base[c] = base[c].fillna(False).astype(bool)
+        base["excluded_any"] = base["excluded_crop"] | base["excluded_saturation"]
+        base["excluded_reason"] = np.select(
+            [
+                base["excluded_crop"] & base["excluded_saturation"],
+                base["excluded_crop"],
+                base["excluded_saturation"],
+            ],
+            ["crop+saturation", "crop", "saturation"],
+            default="",
+        )
+    elif exclusion_flags is not None and len(exclusion_flags) > 0:
         flag_cols = [c for c in ("excluded_crop", "excluded_saturation") if c in exclusion_flags.columns]
         if flag_cols:
             flags = exclusion_flags.copy()
+            _normalize_id_key(flags, key_cols)
             for c in flag_cols:
                 flags[c] = flags[c].fillna(False).astype(bool)
             flags = flags.groupby(key_cols, as_index=False, dropna=False)[flag_cols].max()
@@ -110,11 +148,7 @@ def merge_catalogs(
                     base["excluded_crop"],
                     base["excluded_saturation"],
                 ],
-                [
-                    "crop+saturation",
-                    "crop",
-                    "saturation",
-                ],
+                ["crop+saturation", "crop", "saturation"],
                 default="",
             )
 
@@ -132,6 +166,7 @@ def merge_catalogs(
         rows.append(df[keep_cols])
 
     fit = pd.concat(rows, ignore_index=True)
+    _normalize_id_key(fit, key_cols)
 
     if fit.duplicated(subset=key_cols).any():
         n_dup = int(fit.duplicated(subset=key_cols).sum())

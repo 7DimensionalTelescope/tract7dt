@@ -1,4 +1,4 @@
-# tract7dt Documentation
+# Tract7DT Documentation
 
 `tract7dt` is a 7DT image-specific Tractor photometry pipeline.
 
@@ -12,12 +12,14 @@ Hosted site: https://seoldh99.github.io/tract7dt/
 
 At a high level, `tract7dt run --config ...` executes:
 
-1. **Load and validate inputs** — read the source catalog, load FITS images, build the white-stack coadd, apply crop and saturation filters.
-2. **Build ePSF products** — construct an empirical PSF per band in each spatial grid cell, using SEP detections and optionally Gaia DR3 XP synthetic photometry.
-3. **Build patch definitions** — subdivide the image into spatial patches for parallel processing.
-4. **Build patch input payloads** — assign sources to patches and serialize per-patch data bundles.
-5. **Run Tractor patch subprocesses** — fit source models independently in each patch.
-6. **Merge patch outputs** — combine all patch fit results into a single final catalog.
+1. **Load and validate inputs** — read the source catalog, load FITS images, build the white-stack coadd, flag sources affected by crop margins or saturation.
+2. **Augment catalog with Gaia sources** *(if `zp.enabled`)* — match input sources against GaiaXP synphot catalog, backfill missing fluxes, and optionally inject unmatched Gaia sources as additional rows for zero-point calibration.
+3. **Build ePSF products** — construct an empirical PSF per band in each spatial grid cell, using SEP detections and optionally Gaia DR3 XP synthetic photometry.
+4. **Build patch definitions** — subdivide the image into spatial patches for parallel processing.
+5. **Build patch input payloads** — assign non-excluded sources to patches and serialize per-patch data bundles.
+6. **Run Tractor patch subprocesses** — fit source models independently in each patch.
+7. **Merge patch outputs** — combine all patch fit results into a single final catalog, preserving excluded sources with flag columns.
+8. **Compute zero-point calibration** *(if `zp.enabled`)* — derive per-band ZP from Gaia-matched stars and apply AB magnitudes to all sources.
 
 ## Key Behavior Highlights
 
@@ -31,9 +33,9 @@ At a high level, `tract7dt run --config ...` executes:
   - See [Input Catalog Reference](input-catalog.md) for comprehensive format documentation.
 
 - **Catalog filtering before fitting**
-  - Crop filtering removes out-of-region sources.
-  - Optional saturation filtering removes near-saturated sources.
-  - Exclusion reason flags are preserved in final merged output (`excluded_*` columns).
+  - Crop filtering flags out-of-region sources (`excluded_crop`).
+  - Optional saturation filtering flags near-saturated sources (`excluded_saturation`).
+  - Flagged sources remain in the catalog and final output with exclusion reason columns (`excluded_*`).
 
 - **Source model selection**
   - `TYPE` column maps to Tractor models: `STAR` → PointSource, `EXP` → ExpGalaxy, `DEV` → DevGalaxy, `SERSIC` → SersicGalaxy.
@@ -48,6 +50,7 @@ At a high level, `tract7dt run --config ...` executes:
   - Worker controls for load stage: `performance.frame_prep_workers`, `performance.white_stack_workers`.
   - ePSF/patch pruning: `epsf.skip_empty_epsf_patches`, `patch_inputs.skip_empty_patch`.
   - Fitting parallelism: `patch_run.max_workers`, `patch_run.threads_per_process`.
+  - Diagnostic plot toggles: `epsf.save_star_local_background_diagnostics` (major impact — one plot per star per cell), `epsf.save_patch_background_diagnostics`, `epsf.save_growth_curve`, `epsf.save_residual_diagnostics`, `patch_run.no_cutouts`, `patch_run.no_patch_overview`. Disabling these can significantly reduce I/O and runtime.
 
 ## Documentation Map
 

@@ -13,8 +13,13 @@ work_dir/
 │   │   └── r00_c00/
 │   │       ├── epsf.npy          # ePSF array (normalized)
 │   │       ├── epsf.png          # ePSF stamp visualization
+│   │       ├── epsf_growth_curve.png      # Encircled-energy diagnostic
+│   │       ├── epsf_residual_diagnostics.png  # Star minus ePSF residual diagnostics
 │   │       ├── meta.json         # ePSF build metadata
 │   │       ├── psfstars.png      # PSF star selection overlay
+│   │       ├── psfstars_bgsub.png  # PSF star overlay on background-subtracted patch
+│   │       ├── background_diagnostics.png  # Raw/background/bg-sub patch panels
+│   │       ├── star_local_background_diagnostics.png  # Per-star raw/annulus/bg-sub diagnostics
 │   │       ├── extracted_stars.png   # Extracted star cutout montage
 │   │       └── used_stars.png        # Fitted star cutout montage
 │   └── epsf_summary.json    # Summary across all bands and cells
@@ -31,7 +36,7 @@ work_dir/
 │       ├── meta.json                       # Patch metadata + PSF audit
 │       ├── patch_overview.png              # Data/Model/Residual overview
 │       └── cutouts/
-│           ├── src_000000.png              # Per-source montage
+│           ├── src_{ID}.png                # Per-source montage (named by source ID)
 │           └── ...
 ├── cropped_images/           # Diagnostic plots
 │   ├── white_before_crop.png
@@ -43,8 +48,25 @@ work_dir/
 │   ├── zp_vs_mag__<band>.png         # Per-band ZP diagnostic plots
 │   ├── zp_summary.csv                # Per-band ZP summary
 │   └── zp_all_bands__per_object.csv  # Per-star ZP values
+├── config_used_{timestamp}.yaml      # Snapshot of the config used for this run
+├── {command}.log                     # Per-command log file (e.g. run.log, merge.log)
 └── output_catalog.csv        # Final merged catalog
 ```
+
+## ePSF Patch Diagnostics
+
+Each `EPSFs/<band>/<epsf_tag>/` directory contains ePSF QA artifacts:
+
+| File | Description |
+|------|-------------|
+| `psfstars.png` | PSF-star selection overlay on the raw ePSF cell image. |
+| `psfstars_bgsub.png` | PSF-star selection overlay on the background-subtracted ePSF cell image. |
+| `background_diagnostics.png` | Three panels: raw patch, estimated background map, raw-minus-background. Written only when `epsf.save_patch_background_diagnostics: true`. |
+| `star_local_background_diagnostics.png` | Per-star diagnostics (one row per used star): raw stamp, annulus sample pixels, background-subtracted stamp. Written only when `epsf.save_star_local_background_diagnostics: true` and local-background subtraction is enabled. If `id_label` is missing/duplicated, this file is skipped with a warning. |
+| `epsf_growth_curve.png` | Encircled-energy growth curve of the final ePSF stamp. |
+| `epsf_residual_diagnostics.png` | Median star/model/residual panel plus normalized residual histogram. |
+
+Per-cell `meta.json` includes `local_bkg_diagnostics.local_bkg_diag_status` to indicate whether `star_local_background_diagnostics.png` was written (`ok`) or skipped (`skipped_*`).
 
 ## Per-Patch Output Directory
 
@@ -57,7 +79,7 @@ Each patch produces a subdirectory under `outputs/` named by its patch tag (e.g.
 | `<tag>_cat_fit.csv` | Per-patch fitted catalog. Contains all input columns plus fit result columns. |
 | `meta.json` | Patch metadata including PSF audit (which bands used ePSF vs fallback), patch geometry, and fitting mode. In multi-band mode, also includes optimizer summary (`niters`, `converged`, `hit_max_iters`); in single-band mode, per-band optimizer diagnostics are in the CSV only. |
 | `patch_overview.png` | Three-panel plot: Data (white stack), Model+Sky, Residual. Source positions shown as crosshairs. |
-| `cutouts/src_NNNNNN.png` | Per-source cutout montage (one row per panel: Data, Model+Sky, Residual; one column per band). Crosshairs show original (lime, dashed) and fitted (magenta, solid) positions. |
+| `cutouts/src_{ID}.png` | Per-source cutout montage (one row per panel: Data, Model+Sky, Residual; one column per band). Crosshairs show original (lime, dashed) and fitted (magenta, solid) positions. Filename uses the source `ID` (e.g. `src_00019.png`, `src_gaia_12345.png`). If `ID` is absent, falls back to zero-padded index (`src_000000.png`). Filesystem-unsafe characters in the ID are replaced with underscores. |
 
 ---
 
@@ -65,16 +87,16 @@ Each patch produces a subdirectory under `outputs/` named by its patch tag (e.g.
 
 **File:** `output_catalog.csv` (or as set by `outputs.final_catalog`)
 
-The merge stage performs a **left join** from the original input catalog onto the concatenated patch fit results, using the merge key (`ID` if present, otherwise `RA`+`DEC`).
+The merge stage performs a **left join** from the base catalog onto the concatenated patch fit results, using the merge key (`ID` if present, otherwise `RA`+`DEC`). The base catalog is the augmented catalog (when `zp.enabled`) or the original input catalog (otherwise). Either way, it includes all sources — both active and excluded — with their flag columns.
 
 As a result:
 
-- **Every row** in the original input catalog appears in the output, even if the source was excluded from fitting.
+- **Every row** in the base catalog appears in the output, even if the source was excluded from fitting.
 - Fit columns are **empty (`NaN`)** for sources that were excluded or not assigned to any patch.
 
 ### Input Catalog Columns (preserved)
 
-All columns from the original input catalog are preserved in their original form. These include `ID`, `RA`, `DEC`, `TYPE`, and any `FLUX_*`, `ELL`, `THETA`, `Re` columns you provided.
+All columns from the base catalog are preserved in their original form. These include `ID`, `RA`, `DEC`, `TYPE`, and any `FLUX_*`, `ELL`, `THETA`, `Re` columns you provided, plus `gaia_source_id` and exclusion flag columns added during the load and augmentation stages.
 
 ### Exclusion Tracking Columns
 
@@ -82,8 +104,8 @@ These columns are added by the pipeline to indicate why a source was excluded fr
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `excluded_crop` | bool | `True` if the source was removed by crop filtering (fell outside the crop margin). |
-| `excluded_saturation` | bool | `True` if the source was removed by saturation-cut filtering (near saturated pixels). |
+| `excluded_crop` | bool | `True` if the source was **flagged** by crop filtering (fell outside the crop margin). |
+| `excluded_saturation` | bool | `True` if the source was **flagged** by saturation-cut filtering (near saturated pixels). |
 | `excluded_any` | bool | `True` if excluded by **any** reason (logical OR of all exclusion flags). |
 | `excluded_reason` | string | Human-readable exclusion reason. Values: `"crop"`, `"saturation"`, `"crop+saturation"`, or `""` (not excluded). |
 
@@ -119,11 +141,11 @@ For each band `{band}` present in the images (matching `FILTER` header values). 
 
 | Column | Type | Unit | Description |
 |--------|------|------|-------------|
-| `FLUX_{band}_fit` | float | scaled counts (ZP = `zp_ref`) | Fitted flux in the given band. In the reference zeropoint system: `mag = -2.5 * log10(FLUX) + zp_ref`. |
-| `FLUXERR_{band}_fit` | float | scaled counts (ZP = `zp_ref`) | Flux uncertainty (1-sigma), derived from the Tractor's parameter variance at the optimized solution. |
+| `FLUX_{band}_fit` | float | scaled counts (nominal ZP = `zp_ref`) | Fitted flux in the given band. Images are scaled so that the nominal ZP equals `zp_ref`, but see note below. |
+| `FLUXERR_{band}_fit` | float | scaled counts (nominal ZP = `zp_ref`) | Flux uncertainty (1-sigma), derived from the Tractor's parameter variance at the optimized solution. |
 
-!!! note "Flux system"
-    All fitted fluxes are in the scaled system defined by `image_scaling.zp_ref` (default 25.0). To convert to AB magnitudes: `m_AB = -2.5 * log10(FLUX_{band}_fit) + 25.0`.
+!!! note "Flux system and approximate vs calibrated magnitudes"
+    All fitted fluxes are in the scaled system defined by `image_scaling.zp_ref` (default 25.0). The formula `m_approx = -2.5 * log10(FLUX_{band}_fit) + zp_ref` gives only an **approximate** AB magnitude. This approximation assumes `ZP_AUTO` in the FITS header is the exact zero-point, but in practice `ZP_AUTO` has errors, and the Tractor photometry method differs from whatever method was used to derive `ZP_AUTO`. For **calibrated** AB magnitudes, use the `MAG_{band}_fit` column (when `zp.enabled`), which applies the ZP derived from Gaia-matched stars: `MAG_{band}_fit = ZP_median - 2.5 * log10(FLUX_{band}_fit)`. The offset `ZP_median - zp_ref` reflects primarily the error in `ZP_AUTO`. When ZP calibration is well-behaved, this offset is small. Note that `ZP_median` and `ZP_AUTO` live in different flux systems (scaled vs original), so comparing them directly is not meaningful — see [Pipeline Behavior — ZP Calibration](pipeline-behavior.md#why-zp-calibration-is-needed).
 
 ### Fitted Morphology Columns
 
@@ -243,7 +265,7 @@ In single-band mode, each source has **multiple blue markers** (one per band, wi
 
 ### Source Cutout Montages
 
-`cutouts/src_NNNNNN.png` shows a grid of panels: one column per band, three rows (Data, Model+Sky, Residual). Markers for the **center source**:
+`cutouts/src_{ID}.png` shows a grid of panels: one column per band, three rows (Data, Model+Sky, Residual). The filename uses the source's `ID` value (e.g. `src_00019.png`, `src_gaia_2518065009826205440.png`). If `ID` is absent, a zero-padded index is used as fallback. Markers for the **center source**:
 
 - **Magenta solid crosshair** — fitted position
 - **Lime dashed crosshair** — original (input) position
@@ -262,8 +284,8 @@ When `zp.enabled: true`, the `ZP/` directory contains:
 
 | File | Description |
 |------|-------------|
-| `input_catalog_*_with_Gaia.csv` | Augmented input catalog with injected Gaia sources and `gaia_source_id` column. |
-| `gaia_augmentation_overlay.png` | White-stack overlay showing original sources (cyan circles), Gaia-matched originals (lime squares), injected Gaia sources (magenta circles), saturation-excluded Gaia sources (red X), and the selection bounding box (yellow dashed). |
+| `input_catalog_*_with_Gaia.csv` | Augmented input catalog with Gaia-matched `gaia_source_id` column and (if `inject_gaia_sources: true`) injected Gaia source rows. |
+| `gaia_augmentation_overlay.png` | White-stack overlay showing original sources (cyan circles), Gaia-matched originals (lime squares), injected Gaia sources (magenta circles, only when `inject_gaia_sources: true`), saturation-excluded Gaia sources (red X), saturation-excluded input sources (red X), crop-excluded input sources (orange X), and the selection bounding box (yellow dashed). |
 | `zp_vs_mag__{band}.png` | Per-band ZP diagnostic scatter plot: ZP vs GaiaXP synphot AB magnitude. Shows non-converged (gray diamonds), sigma-clipped (red X), kept (black circles with error bars), median line, and MAD band. |
 | `zp_summary.csv` | Per-band summary: `n_raw`, `n_kept`, `n_clipped`, `n_nonconverged`, `clip_sigma`, `zp_median`, `zp_err_mad`. |
 | `zp_all_bands__per_object.csv` | Per-star ZP values for all bands, with `is_kept`/`is_clipped` flags. |
@@ -274,8 +296,8 @@ When `zp.enabled: true`, the `ZP/` directory contains:
 
 The merge stage:
 
-1. Reads the original input catalog.
-2. Attaches exclusion flags (crop, saturation) using the merge key.
+1. Reads the base catalog (augmented catalog if ZP is enabled, otherwise the original input catalog). Exclusion flag columns (`excluded_crop`, `excluded_saturation`) are already present from the load stage and are used directly.
+2. Computes `excluded_any` and `excluded_reason` from the flag columns.
 3. Collects all `*_cat_fit.csv` files from per-patch output directories.
 4. Concatenates fit results and handles duplicate merge keys (drops duplicates with a warning; rare boundary sources may appear in two patches).
 5. Performs a **left join**: `base_catalog.merge(fit_results, how="left", on=key_cols)`.

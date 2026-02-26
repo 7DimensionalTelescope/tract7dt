@@ -83,27 +83,30 @@ Review other settings based on your data. Key decisions:
 tract7dt run --config /path/to/config.yaml
 ```
 
-This executes all six stages sequentially: load, ePSF, patches, patch inputs, patch runs, and merge.
+This executes up to eight stages sequentially: load, [Gaia augmentation], ePSF, patches, patch inputs, patch runs, merge, [ZP computation]. Stages in brackets run when `zp.enabled: true`.
 
 ## 5) Useful Partial Commands
 
 Run individual stages when debugging or iterating:
 
 ```bash
-# Load inputs and build ePSF only
+# Load inputs, augment with Gaia (if ZP enabled), and build ePSF only
 tract7dt run-epsf --config /path/to/config.yaml
 
-# Load inputs and build patch geometry
+# Load inputs, augment, and build patch geometry
 tract7dt build-patches --config /path/to/config.yaml
 
-# Load inputs, build patches, and write patch payloads
+# Load inputs, augment, build patches, and write patch payloads
 tract7dt build-patch-inputs --config /path/to/config.yaml
 
-# Run Tractor fitting on existing payloads (no load stage)
+# Run Tractor fitting on existing payloads (no reload)
 tract7dt run-patches --config /path/to/config.yaml
 
-# Merge existing patch results into final catalog
+# Load inputs, augment, and merge existing patch results into final catalog
 tract7dt merge --config /path/to/config.yaml
+
+# Re-compute ZP on existing merged catalog
+tract7dt compute-zp --config /path/to/config.yaml
 ```
 
 See [Commands](commands.md) for details on each command.
@@ -134,5 +137,7 @@ After the pipeline completes:
 3. **Convergence:** Check `opt_converged` and `opt_hit_max_iters` columns.
 4. **Diagnostics:** Browse `cropped_images/white_overlay.png` for a visual overview.
 5. **Per-source results:** Check `outputs/<patch>/cutouts/` for individual source fits.
+6. **Run log:** Check `{work_dir}/run.log` for the full pipeline log.
+7. **Config audit:** Check `{work_dir}/config_used_*.yaml` for the exact config used.
 
 See [Outputs](outputs.md) for complete documentation of all output columns and files.

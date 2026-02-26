@@ -7,12 +7,18 @@ All pipeline commands require `--config /path/to/config.yaml` and execute one or
 | Command | Stages executed | Description |
 |---------|----------------|-------------|
 | `run` | all stages | Full pipeline: load → [augment Gaia] → ePSF → patches → patch inputs → run patches → merge → [compute ZP]. Stages in brackets run when `zp.enabled: true`. |
-| `run-epsf` | load + ePSF | Load inputs, validate, and build ePSF products. Useful for iterating on ePSF parameters. |
-| `build-patches` | load + patches | Load inputs and generate patch geometry definitions. |
-| `build-patch-inputs` | load + patches + payloads | Load inputs, build patches, and write per-patch data payloads. |
+| `run-epsf` | load + [augment Gaia] + ePSF | Load inputs, validate, augment catalog (if ZP enabled), and build ePSF products. Useful for iterating on ePSF parameters. |
+| `build-patches` | load + [augment Gaia] + patches | Load inputs, augment (if ZP enabled), and generate patch geometry definitions. |
+| `build-patch-inputs` | load + [augment Gaia] + patches + payloads | Load inputs, augment (if ZP enabled), build patches, and write per-patch data payloads. |
 | `run-patches` | run patches only | Run Tractor fitting subprocesses on **existing** patch payloads. Does not reload inputs. |
-| `merge` | merge only | Merge **existing** patch fit outputs into the final catalog. Does not reload inputs. |
+| `merge` | load + [augment Gaia] + merge | Load inputs, augment (if ZP enabled), and merge **existing** patch fit outputs into the final catalog. |
 | `compute-zp` | ZP only | Compute zero-point calibration on the **existing** merged catalog. Adds `MAG_*_fit` and `MAGERR_*_fit` columns. |
+
+### Version
+
+```bash
+tract7dt --version
+```
 
 ### Usage
 
@@ -37,7 +43,7 @@ Some commands depend on outputs from earlier stages:
 | `build-patches` | Nothing (loads inputs fresh). |
 | `build-patch-inputs` | Nothing (loads inputs fresh; also builds patches). |
 | `run-patches` | Patch payloads in `outputs.patch_inputs_dir` and ePSF products in `outputs.epsf_dir`. |
-| `merge` | Per-patch fit CSVs in `outputs.tractor_out_dir`. |
+| `merge` | Per-patch fit CSVs in `outputs.tractor_out_dir`. Loads inputs fresh to ensure correct catalog state (including Gaia augmentation). |
 | `compute-zp` | Merged catalog at `outputs.final_catalog` and GaiaXP CSV at `inputs.gaiaxp_synphot_csv`. |
 
 ### Typical Iteration Patterns
@@ -105,6 +111,10 @@ See [Sample Data](sample-data.md) for download behavior, progress display, and u
 
 ## Logging Behavior
 
-- **Pipeline commands** (`run`, `run-epsf`, `build-patches`, `build-patch-inputs`, `run-patches`, `merge`, `compute-zp`) apply the `logging.*` section from the YAML config after loading.
+- **Pipeline commands** (`run`, `run-epsf`, `build-patches`, `build-patch-inputs`, `run-patches`, `merge`, `compute-zp`) apply the `logging.*` section from the YAML config after loading. By default (`logging.file: "auto"`), each command writes to `{work_dir}/{command}.log` (e.g. `run.log`, `merge.log`). Log files use append mode.
 - **`download-sample`** does not read `--config`; it uses an independent logging setup.
 - **`dump-config`** does not read `--config`; it only writes the template file.
+
+## Config Snapshot
+
+Every pipeline or step command saves a timestamped copy of the config file to `{work_dir}/config_used_{YYYYMMDD_HHMMSS}.yaml` before execution. This provides an audit trail of which parameters were used for each run.

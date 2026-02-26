@@ -1085,7 +1085,11 @@ def save_source_montages(
         s_legend = "fit=center crosshair=magenta, orig=crosshair=lime(--), fit/others=x deepskyblue, orig/others=x orange"
         title = s0 + "\n" + s_legend
         fig.suptitle(title, fontsize=12)
-        out_path = outdir / f"src_{si:06d}.png"
+        if sid is not None:
+            safe_id = re.sub(r'[^\w\-.]', '_', str(sid))
+            out_path = outdir / f"src_{safe_id}.png"
+        else:
+            out_path = outdir / f"src_{si:06d}.png"
         plt.savefig(out_path, dpi=_PATCH_PLOT_DPI)
         plt.close(fig)
 

@@ -102,6 +102,8 @@ def _save_augmentation_overlay(
     y_gaia_matched: np.ndarray,
     x_gaia_sat: np.ndarray,
     y_gaia_sat: np.ndarray,
+    excluded_crop: np.ndarray | None = None,
+    excluded_saturation: np.ndarray | None = None,
     bbox: tuple[int, int, int, int],
     outpath: Path,
     dpi: int = 150,
@@ -138,6 +140,22 @@ def _save_augmentation_overlay(
     if np.any(ok_s):
         ax.scatter(x_gaia_sat[ok_s], y_gaia_sat[ok_s], s=40, marker="x",
                    c="red", linewidths=1.0, alpha=0.9, label=f"Gaia saturated ({int(ok_s.sum())})")
+
+    if excluded_saturation is not None:
+        sat_mask = excluded_saturation & ok_o
+        n_sat = int(sat_mask.sum())
+        if n_sat > 0:
+            ax.scatter(x_orig[sat_mask], y_orig[sat_mask], s=60, marker="x",
+                       c="red", linewidths=1.2, alpha=0.9, zorder=5,
+                       label=f"excluded: saturation ({n_sat})")
+
+    if excluded_crop is not None:
+        crop_mask = excluded_crop & ok_o
+        n_crop = int(crop_mask.sum())
+        if n_crop > 0:
+            ax.scatter(x_orig[crop_mask], y_orig[crop_mask], s=60, marker="x",
+                       c="orange", linewidths=1.2, alpha=0.9, zorder=5,
+                       label=f"excluded: crop ({n_crop})")
 
     x0, x1, y0, y1 = bbox
     rect = plt.Rectangle((x0, y0), x1 - x0, y1 - y0, linewidth=1.5,
@@ -260,8 +278,10 @@ def augment_catalog_with_gaia(
 
     x_cat, y_cat = wcs.all_world2pix(cat_ra, cat_dec, 0)
 
+    _excl = input_catalog.get("excluded_any", pd.Series(False, index=input_catalog.index))
+    _active_mask = ~_excl.fillna(False).astype(bool).to_numpy()
     x0_box, x1_box, y0_box, y1_box = _compute_gaia_selection_box(
-        x_sources=x_cat, y_sources=y_cat,
+        x_sources=x_cat[_active_mask], y_sources=y_cat[_active_mask],
         min_box_size=min_box_size, img_h=H, img_w=W,
     )
     logger.info("Gaia selection box (pix): x=[%d,%d], y=[%d,%d], size=%dx%d",
@@ -322,44 +342,51 @@ def augment_catalog_with_gaia(
     if n_filled > 0:
         logger.info("Backfilled %d missing FLUX values for matched sources from Gaia synphot", n_filled)
 
+    inject_gaia = bool(zp_cfg.get("inject_gaia_sources", True))
+
     matched_gaia_ids = set(v for v in gaia_sid_arr if v)
     new_gaia = gaia_box[~gaia_box["source_id"].isin(matched_gaia_ids)].copy().reset_index(drop=True)
     x_gaia_sat = np.array([])
     y_gaia_sat = np.array([])
-    sat_cut_cfg = cfg.get("source_saturation_cut", {})
-    if bool(sat_cut_cfg.get("enabled", True)) and len(new_gaia) > 0:
-        sat_radius = float(sat_cut_cfg.get("radius_pix", 20.0))
-        require_all = bool(sat_cut_cfg.get("require_all_bands", False))
-        new_gaia, x_gaia_sat, y_gaia_sat = _filter_gaia_saturation(
-            new_gaia, image_dict=image_dict, wcs=wcs,
-            radius_pix=sat_radius, require_all_bands=require_all,
-        )
-
-    logger.info("Original sources matched to Gaia: %d | New Gaia sources to inject: %d",
-                int(matched_mask.sum()), len(new_gaia))
     new_rows: list[dict] = []
-    for _, g in new_gaia.iterrows():
-        row: dict[str, Any] = {}
-        if id_col:
-            row[id_col] = f"gaia_{g['source_id']}"
-        row[ra_col] = float(g["ra"])
-        row[dec_col] = float(g["dec"])
-        type_col = col_map.get("type", "TYPE")
-        row[type_col] = "STAR"
-        row["gaia_source_id"] = str(g["source_id"])
 
-        for bn in bandnames:
-            mag_col = f"mag_{bn}"
-            flux_col_name = f"FLUX_{bn}"
-            if mag_col in g.index and np.isfinite(g[mag_col]):
-                row[flux_col_name] = float(10.0 ** ((zp_ref - float(g[mag_col])) / 2.5))
-            else:
-                row[flux_col_name] = 0.0
-        new_rows.append(row)
+    if inject_gaia:
+        sat_cut_cfg = cfg.get("source_saturation_cut", {})
+        if bool(sat_cut_cfg.get("enabled", True)) and len(new_gaia) > 0:
+            sat_radius = float(sat_cut_cfg.get("radius_pix", 20.0))
+            require_all = bool(sat_cut_cfg.get("require_all_bands", False))
+            new_gaia, x_gaia_sat, y_gaia_sat = _filter_gaia_saturation(
+                new_gaia, image_dict=image_dict, wcs=wcs,
+                radius_pix=sat_radius, require_all_bands=require_all,
+            )
 
-    if new_rows:
-        new_df = pd.DataFrame(new_rows)
-        aug_cat = pd.concat([aug_cat, new_df], ignore_index=True)
+        logger.info("Original sources matched to Gaia: %d | New Gaia sources to inject: %d",
+                    int(matched_mask.sum()), len(new_gaia))
+        for _, g in new_gaia.iterrows():
+            row: dict[str, Any] = {}
+            if id_col:
+                row[id_col] = f"gaia_{g['source_id']}"
+            row[ra_col] = float(g["ra"])
+            row[dec_col] = float(g["dec"])
+            type_col = col_map.get("type", "TYPE")
+            row[type_col] = "STAR"
+            row["gaia_source_id"] = str(g["source_id"])
+
+            for bn in bandnames:
+                mag_col = f"mag_{bn}"
+                flux_col_name = f"FLUX_{bn}"
+                if mag_col in g.index and np.isfinite(g[mag_col]):
+                    row[flux_col_name] = float(10.0 ** ((zp_ref - float(g[mag_col])) / 2.5))
+                else:
+                    row[flux_col_name] = 0.0
+            new_rows.append(row)
+
+        if new_rows:
+            new_df = pd.DataFrame(new_rows)
+            aug_cat = pd.concat([aug_cat, new_df], ignore_index=True)
+    else:
+        logger.info("Original sources matched to Gaia: %d | Gaia injection disabled (inject_gaia_sources=false); "
+                    "%d unmatched Gaia sources skipped", int(matched_mask.sum()), len(new_gaia))
 
     zp_dir = Path(outputs["work_dir"]) / "ZP"
     zp_dir.mkdir(parents=True, exist_ok=True)
@@ -381,6 +408,9 @@ def augment_catalog_with_gaia(
     x_matched = x_cat[matched_orig_indices] if len(matched_orig_indices) else np.array([])
     y_matched = y_cat[matched_orig_indices] if len(matched_orig_indices) else np.array([])
 
+    _excl_crop = input_catalog["excluded_crop"].fillna(False).to_numpy(dtype=bool) if "excluded_crop" in input_catalog.columns else None
+    _excl_sat = input_catalog["excluded_saturation"].fillna(False).to_numpy(dtype=bool) if "excluded_saturation" in input_catalog.columns else None
+
     plot_dpi = int(cfg.get("plotting", {}).get("dpi", 150))
     _save_augmentation_overlay(
         white=white, wcs=wcs,
@@ -388,6 +418,8 @@ def augment_catalog_with_gaia(
         x_gaia_new=x_new_gaia, y_gaia_new=y_new_gaia,
         x_gaia_matched=x_matched, y_gaia_matched=y_matched,
         x_gaia_sat=x_gaia_sat, y_gaia_sat=y_gaia_sat,
+        excluded_crop=_excl_crop,
+        excluded_saturation=_excl_sat,
         bbox=(x0_box, x1_box, y0_box, y1_box),
         outpath=zp_dir / "gaia_augmentation_overlay.png",
         dpi=plot_dpi,
@@ -681,10 +713,13 @@ def compute_zp(
 
         zp_map = {row["band"]: (row["zp_median"], row["zp_err_mad"]) for row in summary_rows}
 
+        mag_updates: dict[str, np.ndarray] = {}
         for band in bandnames:
+            mag_col = f"MAG_{band}_fit"
+            magerr_col = f"MAGERR_{band}_fit"
             if band not in zp_map:
-                cat[f"MAG_{band}_fit"] = np.nan
-                cat[f"MAGERR_{band}_fit"] = np.nan
+                mag_updates[mag_col] = np.full(len(cat), np.nan, dtype=float)
+                mag_updates[magerr_col] = np.full(len(cat), np.nan, dtype=float)
                 continue
 
             zp, zp_err = zp_map[band]
@@ -701,12 +736,18 @@ def compute_zp(
             mag[ok] = zp - 2.5 * np.log10(flux[ok])
 
             ok_err = ok & np.isfinite(ferr) & (ferr > 0)
-            magerr_flux = np.full(len(cat), np.nan)
+            magerr_flux = np.full(len(cat), np.nan, dtype=float)
             magerr_flux[ok_err] = K_MAG * (ferr[ok_err] / flux[ok_err])
             magerr[ok_err] = np.sqrt(magerr_flux[ok_err] ** 2 + float(zp_err) ** 2)
 
-            cat[f"MAG_{band}_fit"] = mag
-            cat[f"MAGERR_{band}_fit"] = magerr
+            mag_updates[mag_col] = mag
+            mag_updates[magerr_col] = magerr
+
+        if mag_updates:
+            replace_cols = [c for c in mag_updates if c in cat.columns]
+            if replace_cols:
+                cat = cat.drop(columns=replace_cols)
+            cat = pd.concat([cat, pd.DataFrame(mag_updates, index=cat.index)], axis=1)
 
         cat.to_csv(merged_catalog_path, index=False)
         logger.info("Updated merged catalog with MAG/MAGERR columns: %s", merged_catalog_path)

@@ -12,7 +12,11 @@ load_inputs → [augment_gaia] → build_epsf → build_patches → build_patch_
 
 Stages in brackets are conditional on `zp.enabled: true`.
 
-Each stage can also be run independently via its own CLI command (see [Commands](commands.md)).
+Each stage can also be run independently via its own CLI command (see [Commands](commands.md)). Step commands that require state (`run-epsf`, `build-patches`, `build-patch-inputs`, `merge`) automatically run `load_inputs` and Gaia augmentation (when `zp.enabled`) to ensure the same catalog state as a full `run`.
+
+### Config Snapshot
+
+Before executing any pipeline or step command, the CLI saves a timestamped copy of the config file to `{work_dir}/config_used_{YYYYMMDD_HHMMSS}.yaml`. This provides a record of exactly which parameters were used for each run.
 
 ---
 
@@ -85,7 +89,7 @@ If `crop.enabled: true`:
 
 1. Define crop box: `[margin, W-margin) x [margin, H-margin)` in pixels.
 2. Project all source RA/DEC to pixel coordinates using the first image's WCS.
-3. Sources outside the crop box are marked `excluded_crop = True` and removed from the working catalog.
+3. Sources outside the crop box are **flagged** with `excluded_crop = True`. They remain in the catalog but are excluded from downstream fitting.
 4. Slice the white stack, per-band images, masks, sigma arrays, and WCS to the crop region.
 5. Generate diagnostic plots (pre-crop, post-crop).
 
@@ -96,9 +100,11 @@ If `source_saturation_cut.enabled: true`:
 1. For each source, project RA/DEC to pixel coordinates.
 2. Check a circular disk of radius `source_saturation_cut.radius_pix` pixels around each source.
 3. If any pixel in the disk is flagged as saturated:
-   - `require_all_bands: false` (default): remove if saturated in **any** band.
-   - `require_all_bands: true`: remove only if saturated in **all** bands.
-4. Removed sources are marked `excluded_saturation = True`.
+   - `require_all_bands: false` (default): flag if saturated in **any** band.
+   - `require_all_bands: true`: flag only if saturated in **all** bands.
+4. Affected sources are **flagged** with `excluded_saturation = True`. They remain in the catalog but are excluded from downstream fitting.
+
+After both crop and saturation filtering, a composite flag `excluded_any = excluded_crop | excluded_saturation` is computed. The log reports the number of active (non-excluded) sources.
 
 ### 1.8 Render Overlay Plot
 
@@ -125,23 +131,23 @@ load_inputs timing [s]: prep=X.XX white=X.XX crop=X.XX sat=X.XX overlay=X.XX tot
 
 **Function:** `augment_catalog_with_gaia()` in `zp.py`
 
-Injects GaiaXP synphot sources into the input catalog so they can be fitted by the Tractor and used for zero-point calibration.
+Matches GaiaXP synphot sources against the input catalog and optionally injects unmatched Gaia sources as new rows for ZP calibration.
 
 ### Augmentation Flow
 
 1. Load GaiaXP synphot CSV. Filter by `zp.gaia_mag_min <= phot_g_mean_mag <= zp.gaia_mag_max`.
 2. Project Gaia source RA/DEC to pixel coordinates using WCS.
-3. Compute a square bounding box around all original input catalog sources. Expand to at least `zp.min_box_size_pix x min_box_size_pix`. Shift to keep square at image edges; clamp to crop bounds if the image is smaller.
+3. Compute a square bounding box around **active (non-excluded)** input catalog sources. Expand to at least `zp.min_box_size_pix x min_box_size_pix`. Shift to keep square at image edges; clamp to crop bounds if the image is smaller. Excluded sources (crop/saturation) are not used for box computation to prevent out-of-bounds coordinates from inflating the box.
 4. Filter Gaia sources to those within the bounding box.
 5. RA/DEC match Gaia sources against the input catalog (using `zp.match_radius_arcsec`). Tag matched original sources with `gaia_source_id`. Backfill missing `FLUX_{band}` values for matched sources from Gaia synphot magnitudes.
-6. Remove already-matched Gaia sources from the injection pool. Apply saturation filtering (same config as `source_saturation_cut`) to remaining Gaia sources.
-7. Create new catalog rows for unmatched Gaia sources: `ID=gaia_{source_id}`, `TYPE=STAR`, `FLUX_{band}` from synphot magnitudes (`10^((zp_ref - mag_{band}) / 2.5)`).
-8. Concatenate original catalog + new Gaia rows. Save as `ZP/{name}_with_Gaia.csv`.
-9. Generate augmentation overlay plot.
+6. If `zp.inject_gaia_sources: true` (default): Remove already-matched Gaia sources from the injection pool. Apply saturation filtering (same config as `source_saturation_cut`) to remaining Gaia sources. Create new catalog rows for unmatched Gaia sources: `ID=gaia_{source_id}`, `TYPE=STAR`, `FLUX_{band}` from synphot magnitudes (`10^((zp_ref - mag_{band}) / 2.5)`). Concatenate original catalog + new Gaia rows.
+7. If `zp.inject_gaia_sources: false`: Skip injection entirely. Only the matching (step 5) and its backfill are performed. No new rows are added. Use this when you already have reference sources in the input catalog.
+8. Save the augmented catalog as `ZP/{name}_with_Gaia.csv`.
+9. Generate augmentation overlay plot. Excluded sources (crop/saturation) are overlaid on the plot: red X for saturation-excluded, orange X for crop-excluded.
 
 ### Bounding Box Logic
 
-- The box is the tightest square containing all original catalog sources, expanded to at least `min_box_size_pix` on each side.
+- The box is the tightest square containing all **active (non-excluded)** catalog sources, expanded to at least `min_box_size_pix` on each side.
 - When the box hits an image edge, it shifts to maintain the square shape.
 - If the image is smaller than `min_box_size_pix` in either dimension, the box is clamped to the image bounds.
 
@@ -162,14 +168,31 @@ The image is divided into `epsf_ngrid x epsf_ngrid` cells. For each cell and eac
    - GaiaXP sources are projected to pixel coordinates and magnitude-filtered.
    - Candidates are checked for: edge proximity, saturation, roundness, minimum separation, SNR.
    - Up to `max_stars` are selected per cell.
-3. **ePSF building:** Use `photutils.EPSFBuilder` to construct the ePSF from selected star cutouts.
-4. **Normalization and cropping:** The ePSF is normalized to unit sum and center-cropped to `final_psf_size`.
+3. **Local background correction (optional, enabled by default):**
+   - Estimate/subtract a 2D SEP background map per ePSF cell.
+   - Subtract per-star local annulus background from extracted star cutouts using sigma-clipped annulus median.
+   - Annulus radii are automatically clamped to the stamp size (over-large radius values are safely clipped).
+4. **ePSF building:** Use `photutils.EPSFBuilder` to construct the ePSF from selected star cutouts.
+5. **Normalization and cropping:** The ePSF is normalized to unit sum and center-cropped to `final_psf_size`.
+
+Per patch, additional diagnostics are saved:
+- `background_diagnostics.png` (raw patch / background map / background-subtracted patch)
+- `star_local_background_diagnostics.png` (per-star raw/annulus/bg-sub stamps; one row per used star)
+- `epsf_growth_curve.png` (encircled-energy curve)
+- `epsf_residual_diagnostics.png` (median star/model/residual + normalized residual histogram)
+
+Diagnostic generation can be controlled with:
+- `epsf.save_patch_background_diagnostics`
+- `epsf.save_star_local_background_diagnostics`
+- `epsf.diagnostics_show_colorbar`
+
+For `star_local_background_diagnostics.png`, if used stars have missing or duplicate `id_label`, the plot is skipped with a warning (pipeline continues; ePSF build is not failed).
 
 ### ePSF Cell Activity Filtering
 
 If `epsf.skip_empty_epsf_patches: true`:
 
-- Active ePSF cells are computed from the input catalog source positions after crop/saturation filtering.
+- Active ePSF cells are computed from **non-excluded** input catalog source positions (i.e. sources where `excluded_any = False`).
 - Only cells containing at least one source are processed.
 - Downstream patch definitions are also restricted to active cells.
 - This significantly reduces computation in sparse fields.
@@ -214,9 +237,10 @@ Creates self-contained data payloads for each patch.
 
 ### Source Assignment
 
-1. Project all source RA/DEC to pixel coordinates in the white-stack frame.
-2. For each patch, select sources whose pixel positions fall within the patch's **base** region.
-3. Compute patch-local pixel coordinates: `x_pix_patch = x_pix_white - x0_roi`.
+1. Filter to **active (non-excluded)** sources only — sources with `excluded_any = True` are not assigned to any patch.
+2. Project active source RA/DEC to pixel coordinates in the white-stack frame.
+3. For each patch, select sources whose pixel positions fall within the patch's **base** region.
+4. Compute patch-local pixel coordinates: `x_pix_patch = x_pix_white - x0_roi`.
 
 ### Payload Contents
 
@@ -299,8 +323,8 @@ Combines all per-patch fit results into a single catalog.
 
 ### Merge Flow
 
-1. Read the original input catalog.
-2. Attach exclusion flags (crop, saturation) using the merge key.
+1. Read the base catalog (the augmented catalog if ZP is enabled, otherwise the original input catalog). This catalog already contains `excluded_crop`, `excluded_saturation`, and `excluded_any` flag columns set during the load stage.
+2. Compute `excluded_reason` from the flag columns.
 3. Collect all `*_cat_fit.csv` files matching `merge.pattern`.
 4. From each patch catalog, keep only fit-specific columns (those not already in the base catalog, plus the merge key).
 5. Concatenate all patch catalogs.
@@ -326,7 +350,16 @@ See [Outputs](outputs.md) for complete column documentation.
 
 **Function:** `compute_zp()` in `zp.py`
 
-Derives per-band zero-point from Gaia-matched stars and applies AB magnitudes to all sources.
+Derives per-band zero-point from Gaia-matched stars and applies calibrated AB magnitudes to all sources.
+
+### Why ZP Calibration Is Needed
+
+Images are scaled to a common nominal ZP (`zp_ref`, default 25.0) using the `ZP_AUTO` header keyword. However, `ZP_AUTO` is an approximation from prior photometric calibration and may not exactly match the true zero-point. Additionally, the Tractor's PSF-fitting photometry differs methodologically from whatever produced `ZP_AUTO` (e.g. aperture photometry). The ZP calibration stage measures the actual zero-point of the Tractor flux system by comparing fitted fluxes of Gaia-matched stars against their known GaiaXP synphot magnitudes.
+
+The resulting `ZP_median` per band is the true ZP of the **scaled** flux system. The offset `ZP_median - zp_ref` reflects primarily the error in `ZP_AUTO`.
+
+!!! warning "Do not compare ZP_median directly to ZP_AUTO"
+    `ZP_median` lives in the scaled flux system (nominal ZP = `zp_ref`), while `ZP_AUTO` lives in the original unscaled system. Since each band's `ZP_AUTO` differs slightly from `zp_ref`, the difference `ZP_median - ZP_AUTO` conflates the practical photometric error with the scaling offset (`zp_ref - ZP_AUTO`). The meaningful diagnostic is `ZP_median - zp_ref`, which isolates the true photometric error. Only if `ZP_AUTO` happened to equal `zp_ref` exactly (no scaling applied) would `ZP_median - ZP_AUTO` directly reflect the practical error.
 
 ### ZP Computation Flow
 
@@ -339,7 +372,7 @@ Derives per-band zero-point from Gaia-matched stars and applies AB magnitudes to
    b. Propagate flux error: `ZP_err_i = (2.5/ln10) * (FLUXERR/FLUX)`.
    c. Apply MAD-based iterative sigma clipping (`zp.clip_sigma`, `zp.clip_max_iters`).
    d. Compute weighted median ZP (weighted by `1/ZP_err^2`) and MAD-based error.
-   e. Apply to all sources: `MAG_{band}_fit = ZP - 2.5*log10(FLUX)`, `MAGERR_{band}_fit = sqrt((flux_err_term)^2 + ZP_err^2)`.
+   e. Apply calibrated magnitudes to all sources: `MAG_{band}_fit = ZP_median - 2.5*log10(FLUX)`, `MAGERR_{band}_fit = sqrt((flux_err_term)^2 + ZP_err^2)`.
 4. Save diagnostic plots and summary CSVs to the `ZP/` directory.
 5. Overwrite the merged catalog with the additional `MAG_*_fit` and `MAGERR_*_fit` columns.
 
@@ -351,15 +384,17 @@ Derives per-band zero-point from Gaia-matched stars and applies AB magnitudes to
 
 ## Source Exclusion Tracking
 
-Sources filtered out before fitting are tracked throughout the pipeline and merged back into the final output:
+Sources excluded from fitting are **flagged in-place** on the catalog — they are never physically removed. The exclusion flags are carried through the entire pipeline:
 
-1. During crop filtering, removed sources are flagged with `excluded_crop = True`.
-2. During saturation filtering, removed sources are flagged with `excluded_saturation = True`.
-3. The exclusion flags are keyed by `ID` (preferred) or `(RA, DEC)`.
-4. At merge time, flags are attached to the original input catalog rows.
-5. Composite columns `excluded_any` and `excluded_reason` are computed.
+1. During crop filtering, out-of-crop sources are flagged with `excluded_crop = True`.
+2. During saturation filtering, sources near saturated pixels are flagged with `excluded_saturation = True`.
+3. A composite flag `excluded_any = excluded_crop | excluded_saturation` is computed immediately after filtering.
+4. Flagged sources remain in the catalog through Gaia augmentation and are written to the augmented CSV.
+5. At patch-building time, only active (`excluded_any = False`) sources are assigned to patches for fitting.
+6. At merge time, the base catalog already contains all sources and their flags. Excluded sources appear with empty fit columns (`NaN`).
+7. The `excluded_reason` column is computed during merge: `"crop"`, `"saturation"`, `"crop+saturation"`, or `""`.
 
-This design ensures that the final catalog is always the same length as the input catalog, making it straightforward to cross-match with external datasets.
+This design ensures that the final catalog always contains **every** input source (plus any injected Gaia sources), making it straightforward to cross-match with external datasets. Excluded sources are clearly identifiable by their flag columns.
 
 ---
 

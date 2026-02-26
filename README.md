@@ -16,9 +16,18 @@ This distribution is licensed under MIT.
 
 ```bash
 python -m pip install tract7dt
+
+# To update an existing installation:
+python -m pip install -U tract7dt
 ```
 
 `astrometry.net` and Tractor must be installed in advance. Python prerequisites such as `numpy`, `scipy`, `astropy`, `photutils`, `sep`, `matplotlib`, `fitsio`, `emcee`, and `PyYAML` are declared as dependencies.
+
+Check your installed version:
+
+```bash
+tract7dt --version
+```
 
 ## Tractor installation (recommended)
 
@@ -99,12 +108,6 @@ Without `--dir`, the command creates the dataset under the current directory usi
 With `--dir /path/to/sample_data_dir`, the dataset directory is created at that exact path.  
 In both cases, FITS names are standardized to `7DT_UDS_m***.fits` and `image_list.txt` is generated with absolute paths.
 
-Maintainers can control source asset defaults via:
-- `TRACT7DT_SAMPLE_REPO`
-- `TRACT7DT_SAMPLE_TAG`
-- `TRACT7DT_SAMPLE_ASSET`
-- optional checksum: `TRACT7DT_SAMPLE_SHA256`
-
 ### 3) Edit required config paths
 
 At minimum, set:
@@ -122,8 +125,8 @@ tract7dt run --config /path/to/config.yaml
 
 ### Role of the config file
 
-- The YAML config centralizes runtime decisions (inputs, outputs, checks, ePSF behavior, patch options, merge behavior, logging, performance knobs).
-- `tract7dt run --config ...` reads this single file and executes the full step chain.
+- The YAML config centralizes runtime decisions (inputs, outputs, checks, ePSF behavior, patch options, merge behavior, ZP calibration, logging, performance knobs).
+- `tract7dt run --config ...` reads this single file and executes the full pipeline (load, ePSF, patches, fitting, merge, and optionally Gaia augmentation + ZP calibration).
 - Subcommands share the same config model, so one file can drive full runs and partial reruns consistently.
 
 For full command/config/behavior reference, see the docs in `docs/` or the hosted site on GitHub Pages.

@@ -20,6 +20,7 @@ from astropy.stats import SigmaClip
 from astropy.table import Table
 from astropy.wcs.utils import proj_plane_pixel_scales
 from photutils.psf import EPSFBuilder, extract_stars
+from photutils.psf.epsf_stars import EPSFStar, EPSFStars
 
 logger = logging.getLogger("tract7dt.epsf")
 
@@ -46,8 +47,8 @@ class EPSFConfig:
     edge_pad: int = 10
     min_sep: float = 30.0
     max_stars: int = 30
-    q_range: tuple[float, float] = (0.95, 1.05)
-    psfstar_mode: str = "gaia"
+    q_range: tuple[float, float] = (0.7, 1.3)
+    psfstar_mode: str = "sep+gaia"
     gaia_mag_min: float = 10.0
     gaia_mag_max: float = 30.0
     gaia_snap_to_sep: bool = True
@@ -64,6 +65,22 @@ class EPSFConfig:
     recenter_boxsize: int = 9
     final_psf_size: int = 55
     save_star_montage_max: int = 100
+    background_subtract_patch: bool = True
+    background_boxsize: int = 96
+    background_filtersize: int = 9
+    background_source_mask_sigma: float = 3.0
+    background_mask_dilate: int = 1
+    star_local_bkg_subtract: bool = True
+    star_local_bkg_annulus_rin_pix: float = 20.0
+    star_local_bkg_annulus_rout_pix: float = 30.0
+    star_local_bkg_sigma: float = 3.0
+    star_local_bkg_minpix: int = 30
+    save_patch_background_diagnostics: bool = True
+    save_star_local_background_diagnostics: bool = True
+    diagnostics_show_colorbar: bool = True
+    save_growth_curve: bool = True
+    save_residual_diagnostics: bool = True
+    residual_diag_max_stars: int = 100
 
 
 def _grid_bounds(nx: int, ny: int, ngrid: int, r: int, c: int) -> tuple[int, int, int, int]:
@@ -76,6 +93,156 @@ def _grid_bounds(nx: int, ny: int, ngrid: int, r: int, c: int) -> tuple[int, int
     y0 = r * y_step
     y1 = ny if r == ngrid - 1 else (r + 1) * y_step
     return x0, x1, y0, y1
+
+
+def _dilate_mask(mask: np.ndarray, n_iter: int = 1) -> np.ndarray:
+    out = np.asarray(mask, dtype=bool).copy()
+    for _ in range(max(0, int(n_iter))):
+        m = out.copy()
+        out[1:, :] |= m[:-1, :]
+        out[:-1, :] |= m[1:, :]
+        out[:, 1:] |= m[:, :-1]
+        out[:, :-1] |= m[:, 1:]
+        out[1:, 1:] |= m[:-1, :-1]
+        out[1:, :-1] |= m[:-1, 1:]
+        out[:-1, 1:] |= m[1:, :-1]
+        out[:-1, :-1] |= m[1:, 1:]
+    return out
+
+
+def _estimate_patch_background(
+    *,
+    img: np.ndarray,
+    sigma: np.ndarray,
+    bad: np.ndarray,
+    cfg: EPSFConfig,
+):
+    arr = np.ascontiguousarray(img, dtype=np.float32)
+    sig = np.ascontiguousarray(sigma, dtype=np.float32)
+    m_bad = np.ascontiguousarray(bad.astype(bool), dtype=np.bool_)
+    m_work = m_bad.copy()
+
+    good = (~m_work) & np.isfinite(arr) & np.isfinite(sig) & (sig > 0)
+    if np.any(good):
+        med = float(np.nanmedian(arr[good]))
+        sig_med = float(np.nanmedian(sig[good]))
+        if np.isfinite(sig_med) and sig_med > 0:
+            src = good & (arr > med + float(cfg.background_source_mask_sigma) * sig_med)
+            if np.any(src):
+                m_work |= _dilate_mask(src, n_iter=int(cfg.background_mask_dilate))
+
+    try:
+        bkg = sep.Background(
+            arr,
+            mask=np.ascontiguousarray(m_work, dtype=np.bool_),
+            bw=max(8, int(cfg.background_boxsize)),
+            bh=max(8, int(cfg.background_boxsize)),
+            fw=max(1, int(cfg.background_filtersize)),
+            fh=max(1, int(cfg.background_filtersize)),
+        )
+        bkg_map = np.asarray(bkg.back(), dtype=np.float32)
+        bkg_rms = np.asarray(bkg.rms(), dtype=np.float32)
+        out = arr - bkg_map
+        stats = dict(
+            patch_bkg_median=float(np.nanmedian(bkg_map)),
+            patch_bkg_mean=float(np.nanmean(bkg_map)),
+            patch_bkg_rms_median=float(np.nanmedian(bkg_rms)),
+            patch_bkg_rms_mean=float(np.nanmean(bkg_rms)),
+            patch_bkg_mask_frac=float(np.mean(m_work)),
+            patch_bkg_status="ok",
+        )
+        return out, bkg_map, bkg_rms, stats
+    except Exception as e:
+        z = np.zeros_like(arr, dtype=np.float32)
+        stats = dict(
+            patch_bkg_median=0.0,
+            patch_bkg_mean=0.0,
+            patch_bkg_rms_median=np.nan,
+            patch_bkg_rms_mean=np.nan,
+            patch_bkg_mask_frac=float(np.mean(m_work)),
+            patch_bkg_status="error",
+            patch_bkg_error=f"{type(e).__name__}: {e}",
+        )
+        return arr.copy(), z, z, stats
+
+
+def _subtract_local_background_from_stars(*, stars, cfg: EPSFConfig):
+    if stars is None:
+        return None, []
+    star_list = list(stars.all_stars) if hasattr(stars, "all_stars") else list(stars)
+    if len(star_list) == 0:
+        return stars, []
+
+    out_stars: list[EPSFStar] = []
+    local_stats: list[dict] = []
+    sigclip = SigmaClip(sigma=float(cfg.star_local_bkg_sigma), maxiters=5)
+
+    for st in star_list:
+        data = np.asarray(st.data, dtype=np.float32)
+        weights = np.asarray(getattr(st, "weights", np.ones_like(data)), dtype=np.float32)
+        ny, nx = data.shape
+
+        center = getattr(st, "cutout_center", None)
+        if center is None:
+            cx = float((nx - 1) / 2.0)
+            cy = float((ny - 1) / 2.0)
+            cutout_center = None
+        else:
+            cx = float(center[0])
+            cy = float(center[1])
+            cutout_center = (cx, cy)
+
+        max_r = max(2.0, min((nx - 1) / 2.0, (ny - 1) / 2.0) - 1.0)
+        rout = float(np.clip(float(cfg.star_local_bkg_annulus_rout_pix), 2.0, max_r))
+        rin = float(np.clip(float(cfg.star_local_bkg_annulus_rin_pix), 0.0, max(0.0, rout - 1.0)))
+
+        yy, xx = np.indices(data.shape, dtype=np.float32)
+        rr2 = (xx - cx) ** 2 + (yy - cy) ** 2
+        ann = (rr2 >= rin * rin) & (rr2 <= rout * rout)
+        valid = ann & np.isfinite(data) & np.isfinite(weights) & (weights > 0)
+        vals = data[valid]
+
+        local_bkg = 0.0
+        status = "fallback_zero"
+        if vals.size >= int(cfg.star_local_bkg_minpix):
+            clipped = sigclip(vals, masked=True)
+            if hasattr(clipped, "compressed"):
+                vv = np.asarray(clipped.compressed(), dtype=np.float32)
+            else:
+                vv = np.asarray(clipped, dtype=np.float32)
+            vv = vv[np.isfinite(vv)]
+            if vv.size >= int(cfg.star_local_bkg_minpix):
+                local_bkg = float(np.nanmedian(vv))
+                status = "ok"
+
+        data_sub = data - float(local_bkg)
+        origin_raw = np.asarray(getattr(st, "origin", (0, 0))).astype(int).tolist()
+        if len(origin_raw) >= 2:
+            origin = (int(origin_raw[0]), int(origin_raw[1]))
+        else:
+            origin = (0, 0)
+
+        st_new = EPSFStar(
+            data_sub,
+            weights=weights,
+            cutout_center=cutout_center,
+            origin=origin,
+            wcs_large=getattr(st, "wcs_large", None),
+            id_label=getattr(st, "id_label", None),
+        )
+        out_stars.append(st_new)
+        local_stats.append(
+            dict(
+                id_label=str(getattr(st, "id_label", "")),
+                local_bkg=float(local_bkg),
+                annulus_npix=int(vals.size),
+                annulus_rin=float(rin),
+                annulus_rout=float(rout),
+                status=status,
+            )
+        )
+
+    return EPSFStars(out_stars), local_stats
 
 
 def _select_psf_stars_sep(
@@ -507,11 +674,11 @@ def _build_epsf_from_invvar(*, img: np.ndarray, invvar: np.ndarray, star_tbl: Ta
     img = np.ascontiguousarray(img, dtype=np.float32)
     invvar = np.ascontiguousarray(invvar, dtype=np.float32)
 
-    id_to_origin: dict[int, str] = {}
+    id_to_origin: dict[str, str] = {}
     if ("id" in star_tbl.colnames) and ("origin" in star_tbl.colnames):
         for i, o in zip(star_tbl["id"], star_tbl["origin"]):
             try:
-                id_to_origin[int(i)] = str(o)
+                id_to_origin[str(i)] = str(o)
             except Exception:
                 pass
 
@@ -526,6 +693,13 @@ def _build_epsf_from_invvar(*, img: np.ndarray, invvar: np.ndarray, star_tbl: Ta
     stars = extract_stars(nd, star_tbl, size=int(cfg.cutout_size))
     if stars is None or len(stars) == 0:
         return None
+    stars_raw = stars
+    local_bkg_stats = []
+    if bool(getattr(cfg, "star_local_bkg_subtract", True)):
+        stars_corr, local_bkg_stats = _subtract_local_background_from_stars(stars=stars, cfg=cfg)
+        if stars_corr is not None and len(stars_corr) > 0:
+            stars = stars_corr
+    stars_bgsub = stars
 
     sigclip = SigmaClip(sigma=5.0) if cfg.do_clip else SigmaClip(sigma=np.inf)
     epsf_builder = EPSFBuilder(
@@ -542,11 +716,15 @@ def _build_epsf_from_invvar(*, img: np.ndarray, invvar: np.ndarray, star_tbl: Ta
     except Exception as e:
         return dict(
             epsf_arr=None,
+            epsf_model=None,
             nstars_extract=int(len(stars)),
             nstars_used=0,
             stars_all=stars,
+            stars_all_raw=stars_raw,
+            stars_all_bgsub=stars_bgsub,
             stars_used=None,
             id_to_origin=id_to_origin,
+            local_bkg_stats=local_bkg_stats,
             error=f"{type(e).__name__}: {e}",
         )
 
@@ -569,11 +747,16 @@ def _build_epsf_from_invvar(*, img: np.ndarray, invvar: np.ndarray, star_tbl: Ta
 
     return dict(
         epsf_arr=arr,
+        epsf_model=epsf,
         nstars_extract=n_extract,
         nstars_used=n_used,
         stars_all=stars,
+        stars_all_raw=stars_raw,
+        stars_all_bgsub=stars_bgsub,
         stars_used=fitted,
         id_to_origin=id_to_origin,
+        local_bkg_stats=local_bkg_stats,
+        epsf_qa=_epsf_growth_metrics(arr),
     )
 
 
@@ -661,13 +844,352 @@ def _save_epsf_stamp(epsf_arr: np.ndarray, outpath: Path, title: str, dpi: int =
     plt.close(fig)
 
 
+def _save_patch_background_diagnostics(
+    img_raw: np.ndarray,
+    img_bsub: np.ndarray,
+    bkg_map: np.ndarray,
+    outpath: Path,
+    title: str,
+    dpi: int = 150,
+    show_colorbar: bool = True,
+):
+    import matplotlib.pyplot as plt
+
+    outpath.parent.mkdir(parents=True, exist_ok=True)
+
+    def _lims(a: np.ndarray):
+        m = np.isfinite(a)
+        if not np.any(m):
+            return None, None
+        return np.percentile(a[m], [5, 99])
+
+    rvmin, rvmax = _lims(img_raw)
+    bvmin, bvmax = _lims(bkg_map)
+    svmin, svmax = _lims(img_bsub)
+
+    fig, axes = plt.subplots(1, 3, figsize=(11, 3.7), constrained_layout=True)
+    im0 = axes[0].imshow(img_raw, origin="lower", cmap="gray", vmin=rvmin, vmax=rvmax, interpolation="nearest")
+    axes[0].set_title("raw patch")
+    im1 = axes[1].imshow(bkg_map, origin="lower", cmap="viridis", vmin=bvmin, vmax=bvmax, interpolation="nearest")
+    axes[1].set_title("background map")
+    im2 = axes[2].imshow(img_bsub, origin="lower", cmap="gray", vmin=svmin, vmax=svmax, interpolation="nearest")
+    axes[2].set_title("raw - background")
+    for ax in axes:
+        ax.set_xticks([])
+        ax.set_yticks([])
+    if bool(show_colorbar):
+        fig.colorbar(im0, ax=axes[0], fraction=0.047, pad=0.02)
+        fig.colorbar(im1, ax=axes[1], fraction=0.047, pad=0.02)
+        fig.colorbar(im2, ax=axes[2], fraction=0.047, pad=0.02)
+    fig.suptitle(title, fontsize=11)
+    plt.savefig(outpath, dpi=dpi)
+    plt.close(fig)
+
+
+def _epsf_growth_metrics(epsf_arr: np.ndarray) -> dict:
+    arr = np.asarray(epsf_arr, dtype=np.float32)
+    ny, nx = arr.shape
+    cy = (ny - 1) / 2.0
+    cx = (nx - 1) / 2.0
+    yy, xx = np.indices(arr.shape, dtype=np.float32)
+    rr = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+    rmax = int(np.ceil(np.nanmax(rr)))
+    radii = np.arange(rmax + 1, dtype=np.float32)
+    csum = np.array([float(np.sum(arr[rr <= r])) for r in radii], dtype=np.float64)
+    total = float(csum[-1]) if csum.size > 0 else float(np.sum(arr))
+    if np.isfinite(total) and total != 0.0:
+        ee = csum / total
+    else:
+        ee = np.zeros_like(csum)
+
+    def _r_at(frac: float):
+        m = np.where(ee >= float(frac))[0]
+        if m.size == 0:
+            return np.nan
+        return float(radii[m[0]])
+
+    edge = np.concatenate([arr[0, :], arr[-1, :], arr[:, 0], arr[:, -1]])
+    return dict(
+        ee_r50_pix=_r_at(0.5),
+        ee_r80_pix=_r_at(0.8),
+        ee_r90_pix=_r_at(0.9),
+        ee_edge=float(ee[-1]) if ee.size > 0 else np.nan,
+        epsf_edge_median=float(np.nanmedian(edge)),
+        epsf_edge_mean=float(np.nanmean(edge)),
+        epsf_min=float(np.nanmin(arr)),
+        epsf_max=float(np.nanmax(arr)),
+    )
+
+
+def _save_epsf_growth_curve(epsf_arr: np.ndarray, outpath: Path, title: str, dpi: int = 150) -> dict:
+    import matplotlib.pyplot as plt
+
+    outpath.parent.mkdir(parents=True, exist_ok=True)
+    arr = np.asarray(epsf_arr, dtype=np.float32)
+    ny, nx = arr.shape
+    cy = (ny - 1) / 2.0
+    cx = (nx - 1) / 2.0
+    yy, xx = np.indices(arr.shape, dtype=np.float32)
+    rr = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+    rmax = int(np.ceil(np.nanmax(rr)))
+    radii = np.arange(rmax + 1, dtype=np.float32)
+    csum = np.array([float(np.sum(arr[rr <= r])) for r in radii], dtype=np.float64)
+    total = float(csum[-1]) if csum.size > 0 else float(np.sum(arr))
+    if np.isfinite(total) and total != 0.0:
+        ee = csum / total
+    else:
+        ee = np.zeros_like(csum)
+
+    qa = _epsf_growth_metrics(arr)
+
+    fig, ax = plt.subplots(1, 1, figsize=(5.0, 3.8), constrained_layout=True)
+    ax.plot(radii, ee, color="tab:blue", lw=2.0, label="encircled energy")
+    ax.axhline(0.5, color="gray", lw=1.0, ls="--")
+    ax.axhline(0.8, color="gray", lw=1.0, ls=":")
+    if np.isfinite(qa.get("ee_r50_pix", np.nan)):
+        ax.axvline(float(qa["ee_r50_pix"]), color="tab:orange", lw=1.2, ls="--", label=f"r50={qa['ee_r50_pix']:.1f}")
+    if np.isfinite(qa.get("ee_r80_pix", np.nan)):
+        ax.axvline(float(qa["ee_r80_pix"]), color="tab:green", lw=1.2, ls=":", label=f"r80={qa['ee_r80_pix']:.1f}")
+    ax.set_xlabel("radius [pix]")
+    ax.set_ylabel("encircled energy")
+    ax.set_ylim(-0.05, 1.05)
+    ax.grid(alpha=0.2, ls=":")
+    ax.set_title(title)
+    ax.legend(loc="lower right", fontsize=8)
+    plt.savefig(outpath, dpi=dpi)
+    plt.close(fig)
+    return qa
+
+
+def _save_epsf_residual_diagnostics(
+    *,
+    stars_used,
+    epsf_model,
+    outpath: Path,
+    title: str,
+    dpi: int = 150,
+    max_stars: int = 25,
+) -> dict:
+    import matplotlib.pyplot as plt
+
+    outpath.parent.mkdir(parents=True, exist_ok=True)
+    if stars_used is None or epsf_model is None:
+        return dict(resid_nstars=0, resid_rms=np.nan, resid_bias=np.nan, resid_norm_rms=np.nan, resid_norm_bias=np.nan)
+
+    star_list = list(stars_used.all_stars) if hasattr(stars_used, "all_stars") else list(stars_used)
+    if len(star_list) == 0:
+        return dict(resid_nstars=0, resid_rms=np.nan, resid_bias=np.nan, resid_norm_rms=np.nan, resid_norm_bias=np.nan)
+
+    n = min(int(max_stars), len(star_list))
+    data_stack = []
+    model_stack = []
+    resid_stack = []
+    nres_all = []
+
+    for st in star_list[:n]:
+        d = np.asarray(st.data, dtype=np.float32)
+        try:
+            m = np.asarray(st.register_epsf(epsf_model), dtype=np.float32)
+        except Exception:
+            continue
+        if m.shape != d.shape:
+            continue
+        r = d - m
+        data_stack.append(d)
+        model_stack.append(m)
+        resid_stack.append(r)
+
+        w = np.asarray(getattr(st, "weights", np.ones_like(d)), dtype=np.float32)
+        good = np.isfinite(r) & np.isfinite(w) & (w > 0)
+        if np.any(good):
+            nres = r[good] * np.sqrt(w[good])
+            nres_all.append(np.asarray(nres, dtype=np.float32))
+
+    if len(resid_stack) == 0:
+        return dict(resid_nstars=0, resid_rms=np.nan, resid_bias=np.nan, resid_norm_rms=np.nan, resid_norm_bias=np.nan)
+
+    dm = np.nanmedian(np.stack(data_stack, axis=0), axis=0)
+    mm = np.nanmedian(np.stack(model_stack, axis=0), axis=0)
+    rm = np.nanmedian(np.stack(resid_stack, axis=0), axis=0)
+
+    rv = rm[np.isfinite(rm)]
+    resid_bias = float(np.nanmedian(rv)) if rv.size > 0 else np.nan
+    resid_rms = float(np.sqrt(np.nanmean(rv * rv))) if rv.size > 0 else np.nan
+
+    if len(nres_all) > 0:
+        nvec = np.concatenate(nres_all)
+        nvec = nvec[np.isfinite(nvec)]
+    else:
+        nvec = np.array([], dtype=np.float32)
+    n_bias = float(np.nanmedian(nvec)) if nvec.size > 0 else np.nan
+    n_rms = float(np.sqrt(np.nanmean(nvec * nvec))) if nvec.size > 0 else np.nan
+
+    def _lims(a: np.ndarray):
+        m = np.isfinite(a)
+        if not np.any(m):
+            return None, None
+        return np.percentile(a[m], [5, 99])
+
+    dvmin, dvmax = _lims(dm)
+    rvlim = np.percentile(np.abs(rv), 99) if rv.size > 0 else 1.0
+    if not np.isfinite(rvlim) or rvlim <= 0:
+        rvlim = 1.0
+
+    fig, axes = plt.subplots(1, 4, figsize=(13, 3.5), constrained_layout=True)
+    axes[0].imshow(dm, origin="lower", cmap="gray", vmin=dvmin, vmax=dvmax, interpolation="nearest")
+    axes[0].set_title("median star data")
+    axes[1].imshow(mm, origin="lower", cmap="gray", vmin=dvmin, vmax=dvmax, interpolation="nearest")
+    axes[1].set_title("registered ePSF model")
+    im = axes[2].imshow(rm, origin="lower", cmap="RdBu_r", vmin=-rvlim, vmax=rvlim, interpolation="nearest")
+    axes[2].set_title(f"median residual\nrms={resid_rms:.3g}")
+    fig.colorbar(im, ax=axes[2], fraction=0.047, pad=0.02)
+    axes[3].hist(nvec, bins=60, color="tab:purple", alpha=0.85)
+    axes[3].axvline(0.0, color="black", lw=1.0)
+    axes[3].set_title(f"normalized residual\nbias={n_bias:.3g} rms={n_rms:.3g}")
+    axes[3].set_xlabel("(data-model)/sigma")
+    for ax in axes[:3]:
+        ax.set_xticks([])
+        ax.set_yticks([])
+    fig.suptitle(title, fontsize=11)
+    plt.savefig(outpath, dpi=dpi)
+    plt.close(fig)
+
+    return dict(
+        resid_nstars=int(len(resid_stack)),
+        resid_bias=float(resid_bias),
+        resid_rms=float(resid_rms),
+        resid_norm_bias=float(n_bias),
+        resid_norm_rms=float(n_rms),
+    )
+
+
+def _save_star_local_background_diagnostics(
+    *,
+    stars_raw,
+    stars_bgsub,
+    stars_used,
+    local_bkg_stats: list[dict],
+    outpath: Path,
+    title: str,
+    dpi: int = 150,
+    show_colorbar: bool = True,
+) -> dict:
+    import matplotlib.pyplot as plt
+
+    outpath.parent.mkdir(parents=True, exist_ok=True)
+
+    def _to_list(stars_obj):
+        if stars_obj is None:
+            return []
+        if hasattr(stars_obj, "all_stars"):
+            return list(stars_obj.all_stars)
+        return list(stars_obj)
+
+    used_list = _to_list(stars_used)
+    if len(used_list) == 0:
+        used_list = _to_list(stars_bgsub)
+    raw_list = _to_list(stars_raw)
+    bg_list = _to_list(stars_bgsub)
+    if len(used_list) == 0 or len(bg_list) == 0:
+        return dict(local_bkg_diag_nstars=0, local_bkg_diag_status="skipped_no_stars")
+
+    def _sid(st):
+        v = getattr(st, "id_label", None)
+        return "" if v is None else str(v)
+
+    used_ids = [_sid(st) for st in used_list]
+    if any(sid == "" for sid in used_ids):
+        return dict(
+            local_bkg_diag_nstars=0,
+            local_bkg_diag_status="skipped_missing_id_label",
+            local_bkg_diag_message="Missing id_label detected in used stars.",
+        )
+    if len(set(used_ids)) != len(used_ids):
+        return dict(
+            local_bkg_diag_nstars=0,
+            local_bkg_diag_status="skipped_duplicate_id_label",
+            local_bkg_diag_message="Duplicate id_label detected in used stars.",
+        )
+
+    raw_by_id = {_sid(st): st for st in raw_list}
+    bg_by_id = {_sid(st): st for st in bg_list}
+    stats_by_id = {str(d.get("id_label", "")): d for d in (local_bkg_stats or [])}
+
+    rows = []
+    for st in used_list:
+        sid = _sid(st)
+        st_raw = raw_by_id.get(sid, st)
+        st_bg = bg_by_id.get(sid, st)
+        stat = stats_by_id.get(sid, {})
+
+        raw = np.asarray(st_raw.data, dtype=np.float32)
+        bgsub = np.asarray(st_bg.data, dtype=np.float32)
+        w = np.asarray(getattr(st_raw, "weights", np.ones_like(raw)), dtype=np.float32)
+        ny, nx = raw.shape
+
+        center = getattr(st_bg, "cutout_center", None)
+        if center is None:
+            cx = float((nx - 1) / 2.0)
+            cy = float((ny - 1) / 2.0)
+        else:
+            cx = float(center[0])
+            cy = float(center[1])
+
+        rin = float(stat.get("annulus_rin", max(0.0, min(nx, ny) * 0.30)))
+        rout = float(stat.get("annulus_rout", max(rin + 1.0, min(nx, ny) * 0.45)))
+        yy, xx = np.indices(raw.shape, dtype=np.float32)
+        rr2 = (xx - cx) ** 2 + (yy - cy) ** 2
+        ann = (rr2 >= rin * rin) & (rr2 <= rout * rout)
+        ann &= np.isfinite(raw) & np.isfinite(w) & (w > 0)
+
+        ann_img = np.full_like(raw, np.nan, dtype=np.float32)
+        ann_img[ann] = raw[ann]
+        rows.append((sid, raw, ann_img, bgsub, int(np.sum(ann)), float(stat.get("local_bkg", np.nan))))
+
+    n = len(rows)
+    fig, axes = plt.subplots(n, 3, figsize=(10.5, max(2.8, 2.35 * n)), constrained_layout=True)
+    if n == 1:
+        axes = np.asarray(axes, dtype=object).reshape(1, 3)
+
+    for i, (sid, raw, ann_img, bgsub, ann_npix, local_bkg) in enumerate(rows):
+        m = np.isfinite(raw)
+        if np.any(m):
+            vmin, vmax = np.percentile(raw[m], [5, 99])
+        else:
+            vmin, vmax = None, None
+
+        im0 = axes[i, 0].imshow(raw, origin="lower", cmap="gray", vmin=vmin, vmax=vmax, interpolation="nearest")
+        im1 = axes[i, 1].imshow(ann_img, origin="lower", cmap="viridis", interpolation="nearest")
+        im2 = axes[i, 2].imshow(bgsub, origin="lower", cmap="gray", vmin=vmin, vmax=vmax, interpolation="nearest")
+
+        axes[i, 0].set_ylabel(f"id={sid}" if sid != "" else f"star {i}", fontsize=8)
+        if i == 0:
+            axes[i, 0].set_title("raw stamp", fontsize=10)
+            axes[i, 1].set_title("annulus sample", fontsize=10)
+            axes[i, 2].set_title("bg-subtracted stamp", fontsize=10)
+        axes[i, 1].set_xlabel(f"Nann={ann_npix} bkg={local_bkg:.4g}", fontsize=8)
+
+        for ax in axes[i, :]:
+            ax.set_xticks([])
+            ax.set_yticks([])
+        if bool(show_colorbar):
+            fig.colorbar(im0, ax=axes[i, 0], fraction=0.047, pad=0.02)
+            fig.colorbar(im1, ax=axes[i, 1], fraction=0.047, pad=0.02)
+            fig.colorbar(im2, ax=axes[i, 2], fraction=0.047, pad=0.02)
+
+    fig.suptitle(title, fontsize=11)
+    plt.savefig(outpath, dpi=dpi)
+    plt.close(fig)
+    return dict(local_bkg_diag_nstars=int(n), local_bkg_diag_status="ok")
+
+
 def _save_star_montage(
     stars,
     outpath: Path,
     max_stars: int = 25,
     title: str = "stars",
     dpi: int = 150,
-    id_to_origin: dict[int, str] | None = None,
+    id_to_origin: dict[str, str] | None = None,
 ):
     import matplotlib.pyplot as plt
 
@@ -707,11 +1229,8 @@ def _save_star_montage(
         ax.imshow(cut, origin="lower", cmap="gray", vmin=vmin, vmax=vmax, interpolation="nearest")
 
         sid = None
-        if hasattr(st, "id_label"):
-            try:
-                sid = int(st.id_label)
-            except Exception:
-                sid = None
+        if hasattr(st, "id_label") and st.id_label is not None:
+            sid = str(st.id_label)
 
         origin = "unknown"
         if id_to_origin is not None and sid is not None:
@@ -886,17 +1405,17 @@ def _run_epsf_for_band(
 
     need = int(cfg.cutout_size // 2 + cfg.edge_pad)
 
-    cand_full = _sep_extract_candidates_full(
-        img_full=img_full,
-        sigma_full=sig_full,
-        bad_full=bad_full,
-        cfg=cfg,
-        saturate=saturate_scaled,
-    )
-    if cand_full is not None:
-        cand_x_full, cand_y_full, cand_score_full, cand_q_full = cand_full
-    else:
-        cand_x_full = cand_y_full = cand_score_full = cand_q_full = None
+    cand_x_full = cand_y_full = cand_score_full = cand_q_full = None
+    if not bool(getattr(cfg, "background_subtract_patch", True)):
+        cand_full = _sep_extract_candidates_full(
+            img_full=img_full,
+            sigma_full=sig_full,
+            bad_full=bad_full,
+            cfg=cfg,
+            saturate=saturate_scaled,
+        )
+        if cand_full is not None:
+            cand_x_full, cand_y_full, cand_score_full, cand_q_full = cand_full
 
     for pr in range(EPSF_NGRID):
         for pc in range(EPSF_NGRID):
@@ -906,12 +1425,41 @@ def _run_epsf_for_band(
             sig = sig_full[y0:y1, x0:x1]
             bad = bad_full[y0:y1, x0:x1]
             inv = invvar_full[y0:y1, x0:x1]
+            img_sel = img
+            bkg_map = np.zeros_like(img, dtype=np.float32)
+            bkg_rms = np.zeros_like(img, dtype=np.float32)
+            patch_bkg_stats = dict(
+                patch_bkg_median=0.0,
+                patch_bkg_mean=0.0,
+                patch_bkg_rms_median=np.nan,
+                patch_bkg_rms_mean=np.nan,
+                patch_bkg_mask_frac=float(np.mean(bad)),
+                patch_bkg_status="disabled",
+            )
 
             patch_tag = f"r{pr:02d}_c{pc:02d}"
             if active_patch_tags is not None and patch_tag not in active_patch_tags:
                 continue
             patch_dir = band_dir / patch_tag
             patch_dir.mkdir(parents=True, exist_ok=True)
+
+            if bool(getattr(cfg, "background_subtract_patch", True)):
+                img_sel, bkg_map, bkg_rms, patch_bkg_stats = _estimate_patch_background(
+                    img=img,
+                    sigma=sig,
+                    bad=bad,
+                    cfg=cfg,
+                )
+                if bool(getattr(cfg, "save_patch_background_diagnostics", True)):
+                    _save_patch_background_diagnostics(
+                        img_raw=img,
+                        img_bsub=img_sel,
+                        bkg_map=bkg_map,
+                        outpath=patch_dir / "background_diagnostics.png",
+                        title=f"{band} {patch_tag} | patch local background",
+                        dpi=_EPSF_PLOT_DPI,
+                        show_colorbar=bool(getattr(cfg, "diagnostics_show_colorbar", True)),
+                    )
 
             seed_tbl = None
             if (mode in ("sep+gaia", "gaia")) and (gx is not None) and (gy is not None) and (len(gx) > 0):
@@ -939,7 +1487,7 @@ def _run_epsf_for_band(
                 cand_q = qq.tolist()
 
                 star_tbl = _select_psf_stars_from_candidates(
-                    img=img,
+                    img=img_sel,
                     sigma=sig,
                     bad=bad,
                     cfg=cfg,
@@ -953,7 +1501,7 @@ def _run_epsf_for_band(
                 )
             else:
                 star_tbl = _select_psf_stars_sep(
-                    img=img,
+                    img=img_sel,
                     sigma=sig,
                     bad=bad,
                     cfg=cfg,
@@ -971,8 +1519,16 @@ def _run_epsf_for_band(
                 title=f"{band} {patch_tag} | stars selected={len(star_tbl)} (gaia_seed={n_seed})",
                 dpi=_EPSF_PLOT_DPI,
             )
+            if bool(getattr(cfg, "background_subtract_patch", True)):
+                _save_star_overlay(
+                    img_sel,
+                    star_tbl,
+                    outpath=patch_dir / "psfstars_bgsub.png",
+                    title=f"{band} {patch_tag} | stars selected on bg-sub image",
+                    dpi=_EPSF_PLOT_DPI,
+                )
 
-            res = _build_epsf_from_invvar(img=img, invvar=inv, star_tbl=star_tbl, cfg=cfg)
+            res = _build_epsf_from_invvar(img=img_sel, invvar=inv, star_tbl=star_tbl, cfg=cfg)
             if res is None:
                 meta = dict(
                     band=str(band),
@@ -993,6 +1549,7 @@ def _run_epsf_for_band(
                     epsf_shape=None,
                     status="fail",
                     error="None returned",
+                    patch_background=patch_bkg_stats,
                 )
                 (patch_dir / "meta.json").write_text(json.dumps(meta, indent=2))
                 out.append(meta)
@@ -1005,6 +1562,15 @@ def _run_epsf_for_band(
             n_extract = int(res.get("nstars_extract", 0))
             n_used = int(res.get("nstars_used", 0))
             err_msg = res.get("error", None)
+            local_bkg_stats = res.get("local_bkg_stats", []) or []
+            local_bkg_vals = [float(r.get("local_bkg")) for r in local_bkg_stats if np.isfinite(float(r.get("local_bkg", np.nan)))]
+            local_bkg_ok = int(sum(1 for r in local_bkg_stats if str(r.get("status", "")) == "ok"))
+            local_bkg_summary = dict(
+                local_bkg_nstars=int(len(local_bkg_stats)),
+                local_bkg_ok_nstars=int(local_bkg_ok),
+                local_bkg_median=float(np.nanmedian(local_bkg_vals)) if len(local_bkg_vals) > 0 else np.nan,
+                local_bkg_mean=float(np.nanmean(local_bkg_vals)) if len(local_bkg_vals) > 0 else np.nan,
+            )
 
             if epsf_arr is None or n_used <= 0:
                 meta = dict(
@@ -1026,6 +1592,8 @@ def _run_epsf_for_band(
                     epsf_shape=None,
                     status="fail",
                     error=err_msg,
+                    patch_background=patch_bkg_stats,
+                    local_star_background=local_bkg_summary,
                 )
                 (patch_dir / "meta.json").write_text(json.dumps(meta, indent=2))
                 out.append(meta)
@@ -1036,6 +1604,49 @@ def _run_epsf_for_band(
 
             np.save(patch_dir / "epsf.npy", epsf_arr)
             _save_epsf_stamp(epsf_arr, outpath=patch_dir / "epsf.png", title=f"{band} {patch_tag} | used={n_used}/{n_extract}", dpi=_EPSF_PLOT_DPI)
+            epsf_qa = dict(res.get("epsf_qa", {}))
+            if bool(getattr(cfg, "save_growth_curve", True)):
+                epsf_qa.update(
+                    _save_epsf_growth_curve(
+                        epsf_arr,
+                        outpath=patch_dir / "epsf_growth_curve.png",
+                        title=f"{band} {patch_tag} | growth curve",
+                        dpi=_EPSF_PLOT_DPI,
+                    )
+                )
+            residual_qa = dict(resid_nstars=0, resid_rms=np.nan, resid_bias=np.nan, resid_norm_rms=np.nan, resid_norm_bias=np.nan)
+            if bool(getattr(cfg, "save_residual_diagnostics", True)):
+                residual_qa = _save_epsf_residual_diagnostics(
+                    stars_used=res.get("stars_used"),
+                    epsf_model=res.get("epsf_model"),
+                    outpath=patch_dir / "epsf_residual_diagnostics.png",
+                    title=f"{band} {patch_tag} | star - ePSF residual diagnostics",
+                    dpi=_EPSF_PLOT_DPI,
+                    max_stars=int(getattr(cfg, "residual_diag_max_stars", 25)),
+                )
+            local_bkg_diag = dict(local_bkg_diag_nstars=0)
+            if (
+                bool(getattr(cfg, "star_local_bkg_subtract", True))
+                and bool(getattr(cfg, "save_star_local_background_diagnostics", True))
+                and (len(local_bkg_stats) > 0)
+            ):
+                local_bkg_diag = _save_star_local_background_diagnostics(
+                    stars_raw=res.get("stars_all_raw"),
+                    stars_bgsub=res.get("stars_all_bgsub"),
+                    stars_used=res.get("stars_used"),
+                    local_bkg_stats=local_bkg_stats,
+                    outpath=patch_dir / "star_local_background_diagnostics.png",
+                    title=f"{band} {patch_tag} | per-star annulus background diagnostics",
+                    dpi=_EPSF_PLOT_DPI,
+                    show_colorbar=bool(getattr(cfg, "diagnostics_show_colorbar", True)),
+                )
+                if str(local_bkg_diag.get("local_bkg_diag_status", "")) != "ok":
+                    logger.warning(
+                        "%s %s: skipped star_local_background_diagnostics (%s)",
+                        band,
+                        patch_tag,
+                        local_bkg_diag.get("local_bkg_diag_status", "unknown"),
+                    )
 
             id_to_origin = res.get("id_to_origin", None)
             _save_star_montage(
@@ -1073,6 +1684,11 @@ def _run_epsf_for_band(
                 nstars_used=int(n_used),
                 nstars_fitfail=int(max(0, n_extract - n_used)),
                 epsf_shape=list(map(int, epsf_arr.shape)),
+                patch_background=patch_bkg_stats,
+                local_star_background=local_bkg_summary,
+                local_bkg_diagnostics=local_bkg_diag,
+                epsf_qa=epsf_qa,
+                residual_qa=residual_qa,
                 cfg=dict(**{k: getattr(cfg, k) for k in cfg.__dataclass_fields__.keys()}),
                 status="ok",
             )

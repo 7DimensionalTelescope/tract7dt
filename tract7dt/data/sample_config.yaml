@@ -12,13 +12,13 @@
 # This sample config file contains all the parameters.
 
 inputs:
-  tile_name: "your_tile_name"                     # Informational tile name. Does not affect the pipeline.
-  input_catalog: "path/to/input_catalog.csv"  # Path to input catalog CSV file with ID/RA/DEC/TYPE, optional FLUX_{band}/ELL/THETA/Re.
-  image_list_file: "path/to/image_list.txt"     # Path to input image list txt file; one FITS path per line; blank lines and # comments allowed.
+  tile_name: "your_tile_name"                      # Informational tile name. Does not affect the pipeline.
+  input_catalog: "path/to/input_catalog.csv"       # Path to input catalog CSV file with ID/RA/DEC/TYPE, optional FLUX_{band}/ELL/THETA/Re.
+  image_list_file: "path/to/image_list.txt"        # Path to input image list txt file; one FITS path per line; blank lines and # comments allowed.
   gaiaxp_synphot_csv: "path/to/gaiaxp_synphot.csv" # Path to GaiaXP synphot CSV file for this tile.
 
 outputs:
-  work_dir: "/data2/seoldh/test_tract7dt" # Path to base work & output directory.
+  work_dir: "path/to/work_dir"         # Path to base work & output directory.
   cropped_images_dir: "cropped_images" # Path to PNGs from crop + source overlay plots.
   epsf_dir: "EPSFs"                    # Path to EPSF outputs (epsf.npy, meta, pngs).
   patches_dir: "patches"               # Path to Patch definitions (patches.csv/json).
@@ -51,14 +51,14 @@ checks:
   require_same_shape: true             # Enforce same array shape for all images. Should be true.
 
 source_saturation_cut:
-  enabled: true                       # Drop sources near saturated pixels before patch/input generation.
-  radius_pix: 20.0                      # Radial search size [pix] around source position.
-  require_all_bands: false             # false:any-band saturation removes; true:all bands must be saturated.
+  enabled: true                        # Flag sources near saturated pixels (excluded_saturation=True). Flagged sources remain in the catalog but are excluded from fitting.
+  radius_pix: 20.0                     # Radial search size [pix] around source position.
+  require_all_bands: false             # false: flag if saturated in any band; true: flag only if saturated in all bands.
 
 logging:
   ignore_warnings: true                # Suppress Python warnings.
   level: "INFO"                        # Python logging level: DEBUG/INFO/WARNING/ERROR.
-  file: null                           # Optional log file path. null -> console only.
+  file: "auto"                         # "auto": write to {work_dir}/{command}.log (e.g. run.log, merge.log). Explicit path: resolve relative to work_dir. null: console only.
   format: "%(asctime)s | %(name)s | %(levelname)s | %(message)s"  # Log line format.
 
 plotting:
@@ -79,8 +79,8 @@ epsf:
   edge_pad: 10                         # Edge padding for star selection.
   min_sep: 30.0                        # Minimum separation between stars.
   max_stars: 30                        # Maximum stars per patch.
-  q_range: [0.95, 1.05]                # SEP roundness filter (a/b).
-  psfstar_mode: "sep+gaia"                 # "sep", "sep+gaia", or "gaia".
+  q_range: [0.7, 1.3]                  # SEP roundness filter (a/b).
+  psfstar_mode: "sep+gaia"             # "sep", "sep+gaia", or "gaia".
   gaia_mag_min: 10.0                   # Gaia magnitude min.
   gaia_mag_max: 30.0                   # Gaia magnitude max.
   gaia_snap_to_sep: true               # Snap Gaia seeds to SEP detections.
@@ -97,6 +97,22 @@ epsf:
   recenter_boxsize: 9                  # Recentering box size.
   final_psf_size: 55                   # Final PSF crop size.
   save_star_montage_max: 100           # Stars in montage.
+  background_subtract_patch: true      # Subtract a local 2D background map per ePSF cell before star selection/building.
+  background_boxsize: 96               # SEP background mesh box size [pix] (bw=bh).
+  background_filtersize: 9             # SEP background filter size (fw=fh).
+  background_source_mask_sigma: 3.0    # Build extra source mask for background from pixels > median + N*sigma_sky.
+  background_mask_dilate: 1            # Pixel dilation iterations for source mask.
+  star_local_bkg_subtract: true        # Subtract per-star local annulus background from extracted cutouts.
+  star_local_bkg_annulus_rin_pix: 20.0 # Inner radius [pix] of local background annulus in each star cutout.
+  star_local_bkg_annulus_rout_pix: 30.0 # Outer radius [pix] of local background annulus in each star cutout.
+  star_local_bkg_sigma: 3.0            # Sigma-clip threshold for annulus background estimate.
+  star_local_bkg_minpix: 30            # Minimum valid annulus pixels required; otherwise local background falls back to 0.
+  save_patch_background_diagnostics: true  # Save per-cell background_diagnostics.png (raw/background/bg-sub).
+  save_star_local_background_diagnostics: true # Save per-star annulus diagnostics plot.
+  diagnostics_show_colorbar: true      # Show colorbars in background diagnostic plots.
+  save_growth_curve: true              # Save epsf_growth_curve.png and growth metrics in meta.json.
+  save_residual_diagnostics: true      # Save epsf_residual_diagnostics.png using fitted stars.
+  residual_diag_max_stars: 100         # Max stars used for residual diagnostic stacks/histogram.
   parallel_bands: true                 # Build bands in parallel.
   max_workers: "auto"                  # "auto" or integer.
 
@@ -118,15 +134,15 @@ patch_run:
   max_workers: 32                      # Subprocess workers.
   threads_per_process: 1               # BLAS/OpenMP threads per process.
   gal_model: "exp"                     # Default model if TYPE missing: "dev", "exp", "sersic", or "star".
-  n_opt_iters: 25                      # Max optimization iterations.
+  n_opt_iters: 20                      # Max optimization iterations.
   dlnp_stop: 1.0e-6                    # Convergence threshold.
   r_ap: 5.0                            # Aperture radius for flux init.
   eps_flux: 1.0e-4                     # Minimum flux floor.
   sersic_n_init: 3.0                   # Initial Sersic n for sersic model.
   re_fallback_pix: 3.0                 # Fallback Re when missing in catalog.
   psf_model: "pixelized"               # ePSF-present model: "pixelized", "hybrid", or "gaussian_mixture_from_stamp".
-  psf_fallback_model: "moffat" # ePSF-missing fallback: "gaussian_mixture" (not recommended), "ncircular_gaussian", or "moffat".
-  min_epsf_nstars_for_use: 5           # If ePSF exists but nstars_used < this, treat as low-star ePSF failure and fallback.
+  psf_fallback_model: "moffat"         # ePSF-missing fallback: "gaussian_mixture" (not recommended), "ncircular_gaussian", or "moffat".
+  min_epsf_nstars_for_use: 2           # If ePSF exists but nstars_used < this, treat as low-star ePSF failure and fallback.
   ncircular_gaussian_n: 3              # Number of NCircularGaussianPSF components when psf_fallback_model="ncircular_gaussian". Allowed: 1, 2, 3.
   hybrid_psf_n: 9                      # HybridPixelizedPSF N parameter.
   gaussian_mixture_n: 4                # Number of Gaussian components for GaussianMixturePSF.fromStamp.
@@ -155,10 +171,11 @@ merge:
   wcs_fits: null                       # Optional FITS for RA_fit/DEC_fit.
 
 zp:
-  enabled: true                       # Enable zero-point calibration using GaiaXP synphot sources.
-  gaia_mag_min: 8.0                   # Minimum phot_g_mean_mag for Gaia source selection.
+  enabled: true                        # Enable zero-point calibration using GaiaXP synphot sources.
+  inject_gaia_sources: true            # true: inject unmatched Gaia sources as new rows for ZP calibration. false: only match existing input sources against Gaia (add gaia_source_id, backfill FLUX) without injecting new rows.
+  gaia_mag_min: 8.0                    # Minimum phot_g_mean_mag for Gaia source selection.
   gaia_mag_max: 18.0                   # Maximum phot_g_mean_mag for Gaia source selection.
   match_radius_arcsec: 3.0             # RA/DEC match radius for deduplication against input catalog.
-  min_box_size_pix: 1000               # Minimum side length (pixels) of the Gaia selection bounding box.
+  min_box_size_pix: 3000               # Minimum side length (pixels) of the Gaia selection bounding box.
   clip_sigma: 3.0                      # MAD-based sigma clipping threshold for ZP computation.
   clip_max_iters: 10                   # Maximum sigma-clipping iterations.
